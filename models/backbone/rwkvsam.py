@@ -6,22 +6,15 @@ import sys
 
 import torch
 
-from config import (
-    ENCODER_ADDITIONAL_FINAL_LAYERS,
-    ENCODER_ATTENTION_CONFIG,
-    ENCODER_ATTENTION_TYPE,
-    ENCODER_WITH_POS_EMBEDDING,
-)
+from config import cfg
 
 
-def load_encoder(root, checkpoint, variant):
+def build_encoder(root, variant):
     root = Path(root).resolve()
     source = root / "projects/rwkvsam/models/backbones/vitamin.py"
     if not source.is_file():
         raise FileNotFoundError(f"Missing upstream encoder source: {source}")
 
-    checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    state = checkpoint.get("state_dict", checkpoint)
     # The compiler resolves CUDA source paths relative to the checkout.
     previous_directory = Path.cwd()
     write_bytecode = sys.dont_write_bytecode
@@ -32,18 +25,24 @@ def load_encoder(root, checkpoint, variant):
         spec = importlib.util.spec_from_file_location("_sam_moc_vitamin", source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        encoder = module.VITAMINBackbone(
+        backbone = cfg.MODEL_ARCH.backbone
+        return module.VITAMINBackbone(
             model_variant=variant,
-            attn_type=ENCODER_ATTENTION_TYPE,
-            attn_cfg=ENCODER_ATTENTION_CONFIG.copy(),
-            with_pos_embd=ENCODER_WITH_POS_EMBEDDING,
-            additional_final_layers=ENCODER_ADDITIONAL_FINAL_LAYERS,
+            attn_type=backbone.attn_type,
+            attn_cfg=backbone.attn_cfg.copy(),
+            with_pos_embd=backbone.with_pos_embd,
+            additional_final_layers=backbone.additional_final_layers,
         )
     finally:
         sys.dont_write_bytecode = write_bytecode
         os.chdir(previous_directory)
         sys.path.pop(0)
 
+
+def load_encoder(root, checkpoint, variant):
+    checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    state = checkpoint.get("state_dict", checkpoint)
+    encoder = build_encoder(root, variant)
     expected = encoder.state_dict()
     encoder_weights = {}
     for key, value in state.items():

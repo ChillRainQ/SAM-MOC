@@ -1,6 +1,8 @@
 """Train, evaluate and report the visual MOC-6 baseline."""
-from dataclasses import asdict
 from datetime import datetime
+from copy import copy
+from functools import partial
+from itertools import islice
 import json
 import math
 from pathlib import Path
@@ -12,20 +14,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
 
-from config import ALLOW_TF32, ENCODER_CHANNELS, INPUT_SIZE_MULTIPLE, LOSS_FUNCTIONS, RGB_MEAN, RGB_STD
-from moc_adapter import CLASSES, DENSITY_SCALE, MOC6, count_errors
-from models.backbone.rwkvsam import load_encoder
+from config import cfg, LOSS_FUNCTIONS
+from datasets import createTrainData, createValData
+from datasets.basedataset import Dataset
+from datasets.mask_supervision import MaskDataset, mask_collate
+from datasets.setting.MOC_RS import cfg_data
+from misc.utils import eval_mc, is_validation
+from models.backbone.rwkvsam import build_encoder, load_encoder
 from models.counter import Counter
 from models.counters.mcc import MCC
-from project import EXP_CODE_DIR_AND_FILE, EXP_SAVE_PATH, PROJECT_ROOT_DIR
+from project import EXP_CODE_DIR_AND_FILE
+
+CLASSES = tuple(name.capitalize() for name in cfg_data.CATEGORYS)
+DENSITY_SCALE = cfg_data.LOG_PARA
 
 
 def save_density(path, rgb, target, prediction, dots):
     fig, axes = plt.subplots(3, 6, figsize=(16, 8), layout="constrained")
     image = rgb[0].detach().cpu().permute(1, 2, 0).numpy()
-    axes[0, 0].imshow(np.clip(image * RGB_STD + RGB_MEAN, 0, 1))
+    mean, std = cfg_data.MEAN_STD_RGB
+    axes[0, 0].imshow(np.clip(image * std + mean, 0, 1))
     axes[0, 0].set_title("RGB")
     for i, name in enumerate(CLASSES):
         truth = target[0, i].cpu().numpy()
@@ -63,19 +72,23 @@ def plot_metrics(directory, history):
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device, bf16, directory, epoch):
+def evaluate(model, loader, device, bf16, directory, epoch, eval_samples=None):
     model.eval()
     absolute, squared, weighted = [], [], []
     predicted_counts, target_counts = [], []
-    for index, batch in enumerate(loader):
-        rgb, dots = batch["rgb"], batch["dots"]
-        nir = batch.get("nir")
+    for index, batch in enumerate(islice(loader, eval_samples)):
+        rgb = batch["rgb"]
+        dots = batch["gt_map"][:, :len(CLASSES)]
+        inputs = {"rgb": rgb.to(device)}
+        if model.use_nir:
+            inputs["nir"] = batch["nir"].to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
-            density, counts = model(rgb.to(device), nir.to(device) if nir is not None else None)
+            outputs = model(inputs, mode="val")
+        density, counts = outputs["pred_map"], outputs["counts"]
         if not torch.isfinite(density).all():
             raise FloatingPointError(f"Non-finite evaluation density at sample {index}")
         pred = density.cpu()
-        abs_errors, square_errors, weights = count_errors(pred, dots)
+        abs_errors, square_errors, weights = eval_mc(pred, dots, DENSITY_SCALE)
         absolute.append(abs_errors)
         squared.append(square_errors)
         weighted.append(sum(error * weight for error, weight in zip(square_errors, weights, strict=True)))
@@ -83,7 +96,8 @@ def evaluate(model, loader, device, bf16, directory, epoch):
         target_counts.append(dots[0].sum((-2, -1)).numpy() / DENSITY_SCALE)
         if index == 0:
             target = model.density_target(dots.to(device))
-            save_density(directory / f"density_epoch_{epoch:03}.png", rgb, target, pred, dots)
+            filename = "density.png" if epoch is None else f"density_epoch_{epoch:03}.png"
+            save_density(directory / filename, rgb, target, pred, dots)
     mae = np.mean(absolute, axis=0)
     rmse = np.sqrt(np.mean(squared, axis=0))
     counts = np.asarray(predicted_counts)
@@ -106,16 +120,16 @@ def evaluate(model, loader, device, bf16, directory, epoch):
     }
 
 
-def train_epoch(model, loader, optimizer, args, device, log, epoch):
+def train_epoch(model, loader, optimizer, settings, device, log, epoch):
     model.train()
+    if settings.BACKBONE_FREEZE:
+        model.network.encoder.eval()
     for index, batch in enumerate(loader):
-        rgb, dots = batch["rgb"].to(device), batch["dots"].to(device)
-        nir = batch.get("nir")
-        masks = batch.get("masks")
+        batch = {key: value.to(device) for key, value in batch.items() if key != "nir" or model.use_nir}
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.bf16):
-            density, counts, *aux = model(rgb, nir.to(device) if nir is not None else None)
-        loss = model.loss(density, dots, aux[0] if aux else None, masks.to(device) if masks is not None else None)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=settings.BF16):
+            outputs = model(batch, mode="train")
+        loss = model.loss
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite loss at epoch {epoch}, batch {index}")
         loss.backward()
@@ -125,25 +139,28 @@ def train_epoch(model, loader, optimizer, args, device, log, epoch):
             "epoch": epoch, "step": index + 1,
             "loss": loss.item(), "loss_function": model.loss_function,
             "grad_norm": norm.item(),
-            "gt": (dots.sum((-2, -1)) / DENSITY_SCALE).tolist(), "pred": counts.detach().tolist(),
+            "gt": (batch["gt_map"][:, :len(CLASSES)].sum((-2, -1)) / DENSITY_SCALE).tolist(),
+            "pred": outputs["counts"].detach().tolist(),
         }
         if model.loss_function == "Mse_loss":
             record["density_mse"] = record["loss"]
         print(json.dumps(record), file=log, flush=True)
-        if index == 0 or args.steps is not None:
+        if (index + 1) % settings.PRINT_FREQ == 0 or settings.MAX_STEPS is not None:
             print(json.dumps(record))
-        if args.steps is not None and index + 1 >= args.steps:
+        if settings.MAX_STEPS is not None and index + 1 >= settings.MAX_STEPS:
             break
 
 
-def configure_device(args):
-    torch.backends.cuda.matmul.allow_tf32 = ALLOW_TF32
-    torch.backends.cudnn.allow_tf32 = ALLOW_TF32
-    device = torch.device(args.device)
+def configure_device(gpu_id, bf16, allow_tf32=cfg.ALLOW_TF32):
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    device = torch.device("cuda", gpu_id)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Upstream VRWKV requires a CUDA-enabled PyTorch environment")
+    if device.index is not None and device.index >= torch.cuda.device_count():
+        raise ValueError(f"Requested {device}, but only {torch.cuda.device_count()} CUDA device(s) are visible")
     torch.cuda.set_device(device)
-    if args.bf16 and not torch.cuda.is_bf16_supported():
+    if bf16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 is unavailable on the selected GPU")
     return device
 
@@ -167,97 +184,128 @@ def save_code_snapshot(output):
             shutil.copy2(source, target)
 
 
-def validate_config(args):
-    if args.mode not in ("train", "test"):
-        raise ValueError(f"Unknown run mode in config.py: {args.mode}")
-    config_name = "TRAIN_CONFIG" if args.mode == "train" else "TEST_CONFIG"
-    if args.encoder_checkpoint is None:
-        raise ValueError(f"Set {config_name}.encoder_checkpoint in config.py")
-    if args.variant not in ENCODER_CHANNELS:
-        raise ValueError(f"Unknown encoder variant: {args.variant}")
-    if args.split not in ("val", "test"):
-        raise ValueError("Set split to 'val' or 'test' in config.py")
-    if args.crop_size < INPUT_SIZE_MULTIPLE or args.crop_size % INPUT_SIZE_MULTIPLE:
-        raise ValueError(f"crop_size must be a positive multiple of {INPUT_SIZE_MULTIPLE}")
-    if args.eval_samples is not None and args.eval_samples < 1:
-        raise ValueError("eval_samples must be positive when set")
-    if args.mode == "test":
-        if args.evaluate_checkpoint is None:
-            raise ValueError("Set TEST_CONFIG.evaluate_checkpoint in config.py")
-        return
-
-    if args.evaluate_checkpoint is not None or args.split != "val":
-        raise ValueError("Training configuration uses the val split and no evaluation checkpoint")
-    if args.loss_function not in LOSS_FUNCTIONS:
-        raise ValueError(f"Unknown loss function: {args.loss_function}")
-    if args.loss_function == "Mask_loss" and args.mask_dir is None:
-        raise ValueError("Set TRAIN_CONFIG.mask_dir in config.py for Mask_loss")
-    if args.epochs < 1 or args.batch_size < 1 or (args.steps is not None and args.steps < 1):
-        raise ValueError("epochs, batch_size and steps must be positive when set")
-    for name in ("encoder_lr", "base_lr", "weight_decay", "cos_alpha"):
-        value = getattr(args, name)
+def validate_config(settings):
+    if settings.DATASET != "MOC_RS" or settings.NET != "MCC":
+        raise ValueError("Use cfg.DATASET='MOC_RS' and cfg.NET='MCC'")
+    if len(settings.GPU_ID) != 1 or type(settings.GPU_ID[0]) is not int or settings.GPU_ID[0] < 0:
+        raise ValueError("cfg.GPU_ID must contain one nonnegative CUDA device ID")
+    if settings.RESUME and not settings.RESUME_PATH:
+        raise ValueError("Set cfg.RESUME_PATH when cfg.RESUME is True")
+    if not settings.RESUME and not settings.PRE_BACKBONE_WEIGHT:
+        raise ValueError("Set cfg.PRE_BACKBONE_WEIGHT in config.py")
+    backbone = settings.MODEL_ARCH.backbone
+    if backbone.variant not in backbone.channels:
+        raise ValueError(f"Unknown encoder variant: {backbone.variant}")
+    height, width = settings.TRAIN_SIZE
+    if height != width or height < backbone.input_size_multiple or height % backbone.input_size_multiple:
+        raise ValueError(f"cfg.TRAIN_SIZE must be square and divisible by {backbone.input_size_multiple}")
+    if settings.VAL_SAMPLES is not None and settings.VAL_SAMPLES < 1:
+        raise ValueError("cfg.VAL_SAMPLES must be positive when set")
+    if settings.LOSS_FUNCTION not in LOSS_FUNCTIONS:
+        raise ValueError(f"Unknown loss function: {settings.LOSS_FUNCTION}")
+    if settings.LOSS_FUNCTION == "Mask_loss" and not settings.MASK_DIR:
+        raise ValueError("Set cfg.MASK_DIR in config.py for Mask_loss")
+    if settings.MAX_EPOCH < 1 or settings.TRAIN_BATCH_SIZE < 1 or (settings.MAX_STEPS is not None and settings.MAX_STEPS < 1):
+        raise ValueError("MAX_EPOCH, TRAIN_BATCH_SIZE and MAX_STEPS must be positive when set")
+    if settings.PRINT_FREQ < 1 or settings.CP_FREQ < 1:
+        raise ValueError("cfg.PRINT_FREQ and cfg.CP_FREQ must be positive")
+    if (
+        not settings.VAL_STAGE or settings.VAL_STAGE[0] != 0
+        or sorted(set(settings.VAL_STAGE)) != list(settings.VAL_STAGE)
+        or len(settings.VAL_STAGE) != len(settings.VAL_FREQ) or min(settings.VAL_FREQ) < 1
+    ):
+        raise ValueError("Use increasing VAL_STAGE values starting at 0 and one positive VAL_FREQ per stage")
+    for name in ("CONV_LR", "BASE_LR", "WEIGHT_DECAY", "alpha"):
+        value = settings[name]
         if not math.isfinite(value) or value < 0:
-            raise ValueError(f"{name} must be finite and nonnegative")
+            raise ValueError(f"cfg.{name} must be finite and nonnegative")
 
 
-def run(args):
-    validate_config(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = configure_device(args)
+def make_dataset_config(data_path, train_size=None, batch_size=None):
+    data_config = copy(cfg_data)
+    data_config.DATA_PATH = str(data_path)
+    if train_size is not None:
+        data_config.TRAIN_SIZE = tuple(train_size)
+    if batch_size is not None:
+        data_config.TRAIN_BATCH_SIZE = batch_size
+    return data_config
 
-    validation = MOC6(args.data, args.split, use_nir=args.nir)
-    validation[0]
-    if args.eval_samples is not None:
-        validation = Subset(validation, range(min(len(validation), args.eval_samples)))
-    val_loader = DataLoader(validation, batch_size=1)
-    loss_function = args.loss_function
-    if args.evaluate_checkpoint is None:
-        mask_dir = args.mask_dir if loss_function == "Mask_loss" else None
-        training = MOC6(args.data, "train", args.crop_size, use_nir=args.nir, mask_dir=mask_dir)
-        training[0]
-        train_loader = DataLoader(training, batch_size=args.batch_size, shuffle=True, drop_last=True)
-        if not len(train_loader):
-            raise ValueError("batch_size exceeds the training split size")
-        random.seed(args.seed)
 
-    encoder = load_encoder(args.ovsam, args.encoder_checkpoint, args.variant)
+def run(settings):
+    validate_config(settings)
+    random.seed(settings.SEED)
+    np.random.seed(settings.SEED)
+    torch.manual_seed(settings.SEED)
+    device = configure_device(settings.GPU_ID[0], settings.BF16, settings.ALLOW_TF32)
+
+    data_config = make_dataset_config(settings.DATA_PATH, settings.TRAIN_SIZE, settings.TRAIN_BATCH_SIZE)
+    val_loader = createValData(settings.DATASET, Dataset, data_config)
+    val_loader.dataset[0]
+    loss_function = settings.LOSS_FUNCTION
+    use_masks = loss_function == "Mask_loss"
+    dataset_type = partial(MaskDataset, mask_dir=settings.MASK_DIR) if use_masks else Dataset
+    train_loader = createTrainData(settings.DATASET, dataset_type, data_config)
+    if use_masks:
+        train_loader.collate_fn = mask_collate
+    train_loader.dataset[0]
+    if not len(train_loader):
+        raise ValueError("cfg.TRAIN_BATCH_SIZE exceeds the training split size")
+    random.seed(settings.SEED)
+
+    backbone = settings.MODEL_ARCH.backbone
     checkpoint = None
-    if args.evaluate_checkpoint is not None:
-        checkpoint = torch.load(args.evaluate_checkpoint, weights_only=True, map_location="cpu")
-    use_masks = loss_function == "Mask_loss" if checkpoint is None else "mask_head.weight" in checkpoint
+    first_epoch = 1
+    if settings.RESUME:
+        checkpoint = torch.load(settings.RESUME_PATH, weights_only=True, map_location="cpu")
+        first_epoch = checkpoint["epoch"] + 1
+        if first_epoch > settings.MAX_EPOCH:
+            raise ValueError("cfg.MAX_EPOCH must exceed the completed checkpoint epoch")
+        encoder = build_encoder(settings.OVSAM_ROOT, backbone.variant)
+    else:
+        encoder = load_encoder(settings.OVSAM_ROOT, settings.PRE_BACKBONE_WEIGHT, backbone.variant)
+    if settings.BACKBONE_FREEZE:
+        encoder.requires_grad_(False)
     network = MCC(
-        encoder, ENCODER_CHANNELS[args.variant], reference_size=args.crop_size, use_nir=args.nir, use_masks=use_masks
+        encoder, backbone.channels[backbone.variant], reference_size=settings.TRAIN_SIZE[0],
+        use_nir=settings.MM, use_masks=use_masks,
     )
+    model = Counter(network, loss_function, settings.alpha, use_nir=settings.MM).to(device)
+    optimizer = torch.optim.AdamW([
+        {"params": network.encoder.parameters(), "lr": settings.CONV_LR},
+        {"params": [parameter for name, parameter in network.named_parameters() if not name.startswith("encoder.")],
+         "lr": settings.BASE_LR},
+    ], weight_decay=settings.WEIGHT_DECAY)
     if checkpoint is not None:
-        network.load_state_dict(checkpoint)
+        network.load_state_dict(checkpoint["net"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
         del checkpoint
-    model = Counter(network, loss_function, args.cos_alpha).to(device)
-    if args.evaluate_checkpoint is None:
-        optimizer = torch.optim.AdamW([
-            {"params": network.encoder.parameters(), "lr": args.encoder_lr},
-            {"params": [parameter for name, parameter in network.named_parameters() if not name.startswith("encoder.")],
-             "lr": args.base_lr},
-        ], weight_decay=args.weight_decay)
 
     history = []
-    output = args.output
-    if output is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        modality = "rgb_nir" if args.nir else "rgb"
-        output = Path(PROJECT_ROOT_DIR) / EXP_SAVE_PATH / f"{args.mode}_{args.variant}_{modality}_{timestamp}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    exp_name = settings.EXP_NAME or (
+        f"{timestamp}_{settings.DATASET}_MCC_{backbone.variant}_loss_{loss_function}"
+        f"_alpha_{settings.alpha:g}_base_lr_{settings.BASE_LR:g}_NIR={settings.MM}"
+    )
+    output = Path(settings.EXP_PATH) / exp_name
     output.mkdir(parents=True, exist_ok=False)
     save_code_snapshot(output)
-    (output / "config.json").write_text(
-        json.dumps(asdict(args) | {"output": output}, default=str, indent=2), encoding="utf-8"
-    )
+    snapshot = dict(settings) | {
+        "DATA_PATH": Path(settings.DATA_PATH).resolve(),
+        "OVSAM_ROOT": Path(settings.OVSAM_ROOT).resolve(),
+        "EXP_PATH": output.parent.resolve(),
+        "EXP_NAME": output.name,
+    }
+    (output / "config.json").write_text(json.dumps(snapshot, default=str, indent=2), encoding="utf-8")
     with (output / "train.jsonl").open("w", encoding="utf-8") as log:
-        for epoch in range(1, (1 if args.evaluate_checkpoint else args.epochs) + 1):
-            if args.evaluate_checkpoint is None:
-                train_epoch(model, train_loader, optimizer, args, device, log, epoch)
-                torch.save(network.state_dict(), output / "latest.pt")
-            history.append(evaluate(model, val_loader, device, args.bf16, output, epoch))
-            print(json.dumps(history[-1]))
-            (output / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-            plot_metrics(output, history)
+        for epoch in range(first_epoch, settings.MAX_EPOCH + 1):
+            train_epoch(model, train_loader, optimizer, settings, device, log, epoch)
+            state = network.state_dict()
+            torch.save(state, output / "latest.pt")
+            if epoch % settings.CP_FREQ == 0 or epoch == settings.MAX_EPOCH:
+                torch.save({"net": state, "optimizer": optimizer.state_dict(), "epoch": epoch},
+                           output / f"epoch_{epoch:03d}.pth")
+            if is_validation(settings.VAL_STAGE, settings.VAL_FREQ, epoch - 1):
+                history.append(evaluate(model, val_loader, device, settings.BF16, output, epoch, settings.VAL_SAMPLES))
+                print(json.dumps(history[-1]))
+                (output / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+                plot_metrics(output, history)

@@ -2,7 +2,7 @@
 from torch import nn
 from torch.nn import functional as F
 
-from config import FPN_KERNEL_SIZE
+from config import cfg
 
 
 def resize(feature, size):
@@ -13,8 +13,9 @@ class FeaturePyramid(nn.Module):
     def __init__(self, in_channels, width):
         super().__init__()
         self.lateral = nn.ModuleList(nn.Conv2d(c, width, 1) for c in in_channels)
+        kernel = cfg.MODEL_ARCH.fpn.kernel_size
         self.output = nn.ModuleList(
-            nn.Conv2d(width, width, FPN_KERNEL_SIZE, padding=FPN_KERNEL_SIZE // 2)
+            nn.Conv2d(width, width, kernel, padding=kernel // 2)
             for _ in in_channels
         )
 

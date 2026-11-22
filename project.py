@@ -15,7 +15,6 @@ EXP_CODE_DIR_AND_FILE = [
     os.path.join(PROJECT_ROOT_DIR, DATASETS_CODE_DIR),
     os.path.join(PROJECT_ROOT_DIR, MODELS_CODE_DIR),
     os.path.join(PROJECT_ROOT_DIR, "misc"),
-    os.path.join(PROJECT_ROOT_DIR, "moc_adapter.py"),
     os.path.join(PROJECT_ROOT_DIR, PROJECT_FILE),
     os.path.join(PROJECT_ROOT_DIR, TEST_FILE),
     os.path.join(PROJECT_ROOT_DIR, TRAIN_FILE),

@@ -1,11 +1,11 @@
 """Train and validate the visual MOC-6 baseline."""
-from config import TRAIN_CONFIG
+from config import cfg
 
 
 def main():
     from trainer import run
 
-    run(TRAIN_CONFIG)
+    run(cfg)
 
 
 if __name__ == "__main__":

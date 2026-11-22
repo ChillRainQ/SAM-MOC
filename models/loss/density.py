@@ -3,17 +3,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from config import TARGET_GAUSSIAN_RADIUS, TARGET_GAUSSIAN_SIGMA
+from config import cfg
 from misc.layer import Gaussianlayer
 
 
 class GaussianDensity(nn.Module):
     def __init__(self):
         super().__init__()
-        self.gaussian = Gaussianlayer(
-            sigma=[TARGET_GAUSSIAN_SIGMA],
-            kernel_size=2 * TARGET_GAUSSIAN_RADIUS + 1,
-        )
+        gaussian = cfg.MODEL_ARCH.gaussian
+        self.gaussian = Gaussianlayer(sigma=[gaussian.sigma], kernel_size=2 * gaussian.radius + 1)
 
     def forward(self, dots):
         with torch.autocast(dots.device.type, enabled=False):
