@@ -267,22 +267,12 @@ def adjust_double_learning_rate(optimizer,
         coff = (1-cur_iters/max_iters)**power
         lr1 = (base_lr - min_lr)*coff + min_lr
         lr2 = (conv_lr - min_lr)*coff + min_lr
-        for i_p, param in enumerate(optimizer.param_groups,0):
-            if i_p<2:
-                optimizer.param_groups[i_p]['lr'] = lr2
-            elif i_p<5:
-                optimizer.param_groups[i_p]['lr'] = lr1
-            else:
-                print('Invalid lr schedule setting!')
+        optimizer.param_groups[0]['lr'] = lr2
+        optimizer.param_groups[1]['lr'] = lr1
         return lr1, lr2
     else:
-        for i_p, param in enumerate(optimizer.param_groups,0):
-            if i_p<2:
-                optimizer.param_groups[i_p]['lr'] = warmup_conv_lr
-            elif i_p<5:
-                optimizer.param_groups[i_p]['lr'] = warmup_base_lr
-            else:
-                print('Invalid lr schedule setting!')
+        optimizer.param_groups[0]['lr'] = warmup_conv_lr
+        optimizer.param_groups[1]['lr'] = warmup_base_lr
         return warmup_base_lr, warmup_conv_lr
 
 def logger(exp_path, exp_name, work_dir, exception, resume=False):

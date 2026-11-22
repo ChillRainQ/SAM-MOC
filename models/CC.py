@@ -105,9 +105,11 @@ class CrowdCounter(nn.Module):
                 return outputs
             
             elif cfg.LOSS_FUNCTION == 'Mask_loss':
-                mask_map = data['mask_map']
                 if pred_mask_maps is None:
                     raise ValueError("Mask_loss requires the RWKVMCC mask head")
+                if 'mask_map' not in data:
+                    raise ValueError("Mask_loss requires a training batch with binary mask_map targets")
+                mask_map = data['mask_map']
                 outputs['pred_mask_maps'] = pred_mask_maps
                 gauss_map = self.multi_class_gauss_map_generate(gt_map)
                 self.loss_fn = self.build_mask_loss(pred_map, gauss_map, mask_map, pred_mask_maps, iter) 

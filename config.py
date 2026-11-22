@@ -22,7 +22,6 @@ __C.NET = 'RWKVMCC'  # Use 'MCC' for the original Swin baseline
 __C.PRE_BACKBONE_WEIGHT = ''  # Matching RWKV-SAM pretrained checkpoint
 __C.OVSAM_ROOT = Path(__file__).resolve().parent / "third_party" / "ovsam"
 __C.DATA_PATH = os.environ.get("NWPU_MOC_ROOT", str(Path(__file__).resolve().parent / "NWPU-MOC"))
-__C.MASK_DIR = None  # Optional per-image binary mask NPZs for Mask_loss
 __C.MAX_STEPS = None
 __C.VAL_SAMPLES = None
 
@@ -37,9 +36,9 @@ __C.RWKV_ARCH = edict(
         out_indices=(0, 1, -1),
         strides=(4, 8, 16),
     ),
-    fpn=dict(width=128, kernel_size=3),
-    decode_head=dict(width=64, kernel_size=3, norm_groups=8, initial_count=1.0, weight_std=0.001),
-    nir=dict(channels=1, kernel_size=3),
+    fpn=dict(width=128),
+    decode_head=dict(width=64),
+    nir=dict(channels=1),
     mask=dict(classes=2),
 )
 
@@ -60,8 +59,8 @@ __C.TRAIN_SIZE = (512,512)
 
 __C.TRAIN_BATCH_SIZE = 4
 
-__C.BASE_LR = 5*1e-5
-__C.CONV_LR = 1e-6
+__C.BASE_LR = 5e-5  # FPN and counting layers
+__C.CONV_LR = 1e-6  # Image backbone
 __C.WEIGHT_DECAY = 1e-4
 
 __C.LOSS_FUNCTION = 'Mse_loss' # 'Bay_loss' or 'Mse_loss' or 'Bmc_loss' or 'Mix_loss' or 'Trans_loss' or 'Cos_loss' 

@@ -1,6 +1,4 @@
-"""MCC counting network for the E1 MOC-6 baseline."""
-import math
-
+"""Original MCC counting path with a RWKV-SAM image backbone."""
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -8,7 +6,8 @@ from torch.nn import functional as F
 from config import cfg
 from datasets.setting.MOC_RS import cfg_data
 from models.FPN.FPN_Head import FPN
-from models.backbone.rwkvsam import build_encoder, load_encoder
+from models.backbone.rwkvsam import add_nir_input, build_encoder, load_encoder
+from .MCC import SCAModule
 
 NUM_CLASSES = len(cfg_data.CATEGORYS)
 
@@ -25,81 +24,34 @@ class RWKVMCC(nn.Module):
         else:
             self.backbone = build_encoder(cfg.OVSAM_ROOT, variant)
         width = arch.fpn.width
+        reduced_width = arch.decode_head.width
         channels = list(arch.backbone.channels[variant])
         self.fpn = FPN(channels, width, len(channels))
-        self.decoder = VisualDecoder(width)
-        self.head = CountingHead(width)
-        use_nir = cfg.MM
+        self.reduce = nn.Conv2d(len(channels) * width, reduced_width, 1)
+        self.output_layer = SCAModule(reduced_width, NUM_CLASSES)
         use_masks = cfg.LOSS_FUNCTION == "Mask_loss"
-        self.nir_projections = None
-        if use_nir:
-            nir = cfg.RWKV_ARCH.nir
-            kernel = nir.kernel_size
-            self.nir_projections = nn.ModuleList(
-                nn.Conv2d(nir.channels, width, kernel, padding=kernel // 2, bias=False)
-                for _ in cfg.RWKV_ARCH.backbone.strides
-            )
-            for projection in self.nir_projections:
-                nn.init.zeros_(projection.weight)
-        self.mask_classes = cfg.RWKV_ARCH.mask.classes
-        self.mask_head = nn.Conv2d(width, NUM_CLASSES * self.mask_classes, 1) if use_masks else None
+        self.use_nir = cfg.MM
+        if self.use_nir:
+            add_nir_input(self.backbone, arch.nir.channels)
+        self.mask_classes = arch.mask.classes
+        self.mask_head = nn.Conv2d(reduced_width, NUM_CLASSES * self.mask_classes, 1) if use_masks else None
 
     def forward(self, rgb, nir=None, *, return_mask=False):
-        if (self.nir_projections is None) != (nir is None):
+        if self.use_nir != (nir is not None):
             raise ValueError("Provide NIR exactly when the model uses RGB+NIR")
-        # The upstream WKV backward supports FP32 parameters. BF16 can cover the neck and head.
+        # 拼接
+        image = torch.cat((rgb, nir), dim=1) if self.use_nir else rgb
         with torch.autocast(rgb.device.type, enabled=False):
-            features = self.backbone(rgb.float())
+            features = self.backbone(image.float())
+        # 抽头
         selected = tuple(features[index] for index in cfg.RWKV_ARCH.backbone.out_indices)
-        pyramid = self.fpn(selected)
-        if self.nir_projections is not None:
-            pyramid = tuple(
-                feature + projection(F.avg_pool2d(nir, stride))
-                for feature, projection, stride in zip(
-                    pyramid, self.nir_projections, cfg.RWKV_ARCH.backbone.strides, strict=True
-                )
-            )
-        feature = self.decoder(pyramid)
-        density = self.head(feature)
+        # 多尺度融合
+        x = self.fpn(selected)
+        x = torch.cat([F.interpolate(x[0],scale_factor=0.5), x[1],F.interpolate(x[2],scale_factor=2)], dim=1)
+        feature = self.reduce(x)
+        density = self.output_layer(feature)
         if return_mask:
             if self.mask_head is None:
-                raise ValueError("MCC must be constructed with use_masks=True to return mask logits")
+                raise ValueError("Mask logits require cfg.LOSS_FUNCTION = 'Mask_loss'")
             return density, self.mask_head(feature).unflatten(1, (NUM_CLASSES, self.mask_classes))
-        return density
-
-
-class VisualDecoder(nn.Module):
-    def __init__(self, width):
-        super().__init__()
-        self.fuse = nn.Sequential(
-            nn.Conv2d(3 * width, width, 1, bias=False),
-            nn.GroupNorm(cfg.RWKV_ARCH.decode_head.norm_groups, width),
-            nn.GELU(),
-        )
-
-    def forward(self, pyramid):
-        p2, p3, p4 = pyramid
-        size = p3.shape[-2:]
-        return self.fuse(torch.cat((F.interpolate(p2, size=size, mode="bilinear", align_corners=False), p3, F.interpolate(p4, size=size, mode="bilinear", align_corners=False)), dim=1))
-
-
-class CountingHead(nn.Module):
-    def __init__(self, width, initial_count=None, reference_size=None):
-        super().__init__()
-        head = cfg.RWKV_ARCH.decode_head
-        initial_count = head.initial_count if initial_count is None else initial_count
-        reference_size = cfg.TRAIN_SIZE[0] if reference_size is None else reference_size
-        self.predict = nn.Sequential(
-            nn.Conv2d(width, head.width, head.kernel_size, padding=head.kernel_size // 2, bias=False),
-            nn.GroupNorm(head.norm_groups, head.width),
-            nn.GELU(),
-            nn.Conv2d(head.width, NUM_CLASSES, 1),
-        )
-        cells = (reference_size // cfg_data.LABEL_FACTOR) ** 2
-        initial_density = initial_count * cfg_data.LOG_PARA / cells
-        nn.init.normal_(self.predict[-1].weight, std=head.weight_std)
-        nn.init.constant_(self.predict[-1].bias, math.log(math.expm1(initial_density)))
-
-    def forward(self, feature):
-        density = F.softplus(self.predict(feature).float())
         return density

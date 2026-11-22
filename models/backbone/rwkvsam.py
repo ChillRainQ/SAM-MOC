@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import torch
+from torch import nn
 
 from config import cfg
 
@@ -57,3 +58,12 @@ def load_encoder(root, checkpoint, variant):
             encoder_weights[key] = value
     encoder.load_state_dict(encoder_weights, strict=True)
     return encoder
+
+
+def add_nir_input(encoder, channels):
+    """Extend the stem while retaining its pretrained RGB filters."""
+    stem = encoder.stem.conv1
+    weight = stem.weight.detach()
+    nir_weight = weight.new_zeros((weight.shape[0], channels, *weight.shape[2:]))
+    stem.weight = nn.Parameter(torch.cat((weight, nir_weight), dim=1), requires_grad=stem.weight.requires_grad)
+    stem.in_channels += channels

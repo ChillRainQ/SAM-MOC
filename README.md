@@ -1,12 +1,12 @@
 ## RWKV-SAM counting on the NWPU branch
 
-This branch keeps the NWPU-MOC trainer, dataset pipeline, losses and evaluator. `cfg.NET = 'RWKVMCC'` selects the RWKV-SAM image encoder, official three-level FPN, visual counting decoder and density head. `cfg.NET = 'MCC'` selects the original Swin model.
+This branch keeps the NWPU-MOC trainer, dataset pipeline, losses and evaluator. `cfg.NET = 'RWKVMCC'` selects the RWKV-SAM image encoder with the original MCC counting path (three-level FPN, P3 alignment, channel reduction and `SCAModule`). `cfg.NET = 'MCC'` selects the original Swin model.
 
-- Set `cfg.PRE_BACKBONE_WEIGHT` to a matching RWKV-SAM checkpoint and `cfg.GPU_ID` to one CUDA device. The default variant is Large. `cfg.MM` toggles NIR fusion.
+- Set `cfg.PRE_BACKBONE_WEIGHT` to a matching RGB RWKV-SAM checkpoint and `cfg.GPU_ID` to one CUDA device. The default variant is Large. With `cfg.MM = True`, RGB and NIR enter the backbone together. The RGB stem weights are preserved, and the new NIR weights start at zero. With `cfg.MM = False`, the backbone uses RGB.
 - Dataset defaults to project-local `NWPU-MOC/`. The layout is the official `rgb/`, `ir/`, `gt/` and split lists. Set `NWPU_MOC_ROOT` to override it.
 - In a CUDA-enabled environment with the `rwkv` dependencies installed, run `python train.py`. For a smoke run, use `cfg.MAX_STEPS = 3` and `cfg.VAL_SAMPLES = 4`.
 - To evaluate, set `model_path` and `gpu_id` at the top of `test.py`, then run `python test.py`. The loader accepts direct weights and `net` checkpoints. Results are written under the selected experiment.
-- `Mask_loss` requires `cfg.MASK_DIR`. Provide one NPZ per training image, named like its label file, with a binary `mask_map` of shape `[H,W,6]`.
+- `Mask_loss` requires a custom training data loader that supplies binary `mask_map` tensors. The NWPU-MOC loader supplies point labels.
 
 # NWPU-MOC dataset and  Sample Code
 
