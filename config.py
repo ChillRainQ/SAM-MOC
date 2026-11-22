@@ -17,15 +17,20 @@ __C.DATASET = 'MOC_RS' # dataset selection: RGBT, DRONERGBT, GCC, SHHA, SHHB, UC
 __C.MM = False
 
 __C.NET = 'SAM2MCC'  # Use 'MCC' for the original Swin baseline
+__C.SAM2_VARIANT = 'base_plus'  # 'base_plus' or 'large'
 
 
-__C.PRE_BACKBONE_WEIGHT = Path(__file__).resolve().parent / "pretrained_models" / "sam2.1_hiera_large.pt"
+__C.PRE_BACKBONE_WEIGHT = Path(__file__).resolve().parent / "pretrained_models" / f"sam2.1_hiera_{__C.SAM2_VARIANT}.pt"
 __C.DATA_PATH = os.environ.get("NWPU_MOC_ROOT", str(Path(__file__).resolve().parent / "NWPU-MOC"))
 __C.MAX_STEPS = None
 __C.VAL_SAMPLES = None
 
-__C.SAM2_ARCH = edict(
-    backbone=dict(
+_SAM2_BACKBONES = {
+    "base_plus": dict(
+        hiera=dict(embed_dim=112, num_heads=2),
+        channels=(112, 224, 448, 896),
+    ),
+    "large": dict(
         hiera=dict(
             embed_dim=144,
             num_heads=2,
@@ -35,8 +40,12 @@ __C.SAM2_ARCH = edict(
             window_spec=(8, 4, 16, 8),
         ),
         channels=(144, 288, 576, 1152),
-        input_multiple=32,
     ),
+}
+
+__C.SAM2_ARCH = edict(
+    variant=__C.SAM2_VARIANT,
+    backbone=_SAM2_BACKBONES[__C.SAM2_VARIANT],
     fpn=dict(width=128),
     decode_head=dict(width=64),
     nir=dict(channels=1),

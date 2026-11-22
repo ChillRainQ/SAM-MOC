@@ -1,13 +1,13 @@
 ## SAM 2.1 counting on the NWPU branch
 
-`cfg.NET = 'SAM2MCC'` uses the SAM 2.1 Hiera Large backbone. All four Hiera levels feed the NWPU FPN. The stride 4, 8, and 16 FPN outputs are aligned and passed to the original MCC channel reduction and `SCAModule`. `cfg.NET = 'MCC'` selects the original Swin model.
+`cfg.NET = 'SAM2MCC'` defaults to SAM 2.1 Hiera Base Plus. Set `cfg.SAM2_VARIANT = 'large'` in the training config to select Hiera Large. All four Hiera levels feed the NWPU FPN. The stride 4, 8, and 16 FPN outputs are aligned and passed to the original MCC channel reduction and `SCAModule`. `cfg.NET = 'MCC'` selects the original Swin model.
 
 On Linux, install the environment and download the official checkpoint:
 
 ```bash
 SAM2_BUILD_CUDA=0 uv sync --locked
 mkdir -p pretrained_models
-wget -c -P pretrained_models https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+wget -c -P pretrained_models https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
 ```
 
 - Set `cfg.GPU_ID` for the training GPUs. The model loads the Hiera trunk from `cfg.PRE_BACKBONE_WEIGHT`. With `cfg.MM = True`, it expands the RGB stem with zero-initialized NIR filters. With `cfg.MM = False`, the backbone uses RGB.

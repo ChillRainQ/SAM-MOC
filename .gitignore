@@ -4,3 +4,4 @@ exp/
 .idea/
 /pretrained_models/
 NWPU-MOC/
+config.py

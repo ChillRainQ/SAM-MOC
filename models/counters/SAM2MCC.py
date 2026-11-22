@@ -18,9 +18,8 @@ class SAM2MCC(nn.Module):
         arch = cfg.SAM2_ARCH
         checkpoint = cfg.PRE_BACKBONE_WEIGHT if pretrained else None
         if pretrained and not checkpoint:
-            raise ValueError("Set cfg.PRE_BACKBONE_WEIGHT to the official SAM 2.1 Large checkpoint")
+            raise ValueError("Set cfg.PRE_BACKBONE_WEIGHT to the matching SAM 2.1 checkpoint")
         self.backbone = build_encoder(arch.backbone.hiera, checkpoint)
-        self.input_multiple = arch.backbone.input_multiple
         width = arch.fpn.width
         reduced_width = arch.decode_head.width
         channels = list(arch.backbone.channels)
@@ -39,19 +38,11 @@ class SAM2MCC(nn.Module):
             raise ValueError("Provide NIR exactly when the model uses RGB+NIR")
         # 拼接
         image = torch.cat((rgb, nir), dim=1) if self.use_nir else rgb
-        height, width = image.shape[-2:]
-        pad_height = (-height) % self.input_multiple
-        pad_width = (-width) % self.input_multiple
-        if pad_height or pad_width:
-            image = F.pad(image, (0, pad_width, 0, pad_height))
         features = self.backbone(image)
         # 多尺度融合
-        # The fourth level contributes through the FPN top-down path.
         x = self.fpn(features)
         x = torch.cat([F.interpolate(x[0],scale_factor=0.5), x[1],F.interpolate(x[2],scale_factor=2)], dim=1)
         feature = self.reduce(x)
-        factor = cfg_data.LABEL_FACTOR
-        feature = feature[:, :, :height // factor, :width // factor]
         density = self.output_layer(feature)
         if return_mask:
             if self.mask_head is None:
