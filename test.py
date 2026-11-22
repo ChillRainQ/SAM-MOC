@@ -1,137 +1,235 @@
-"""Evaluate the saved checkpoint of an existing experiment."""
-from collections import OrderedDict
-from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import datetime
+from locale import getlocale
 import json
+import os
 from pathlib import Path
-import random
-
-import numpy as np
-from numpy._core import multiarray
 import torch
+from torch.autograd import Variable
+import torchvision.transforms as standard_transforms
+import misc.transforms as own_transforms
+from importlib import import_module
+
+from models.CC import CrowdCounter
+
+from misc.utils import *
+
+from misc import layer
+from PIL import Image
+
+import time
+
+from checkpoint import load_counter_weights
+
+import datasets
 
 from config import cfg
-from datasets import createTestData, createValData
-from datasets.basedataset import Dataset
-from models.backbone.rwkvsam import build_encoder
-from models.counter import Counter
-from models.counters.mcc import MCC
-from project import PROJECT_ROOT_DIR
-from trainer import configure_device, evaluate, make_dataset_config, plot_metrics
 
+#------------prepare data loader------------
+dataset = 'MOC_RS'
 
-@dataclass(frozen=True, kw_only=True)
-class TestConfig:
-    model_path: Path | None = None
-    gpu_id: int = 0
-    split: str = "test"
-    eval_samples: int | None = None
+model_path = ''
 
+datasetting = import_module(f'datasets.setting.{dataset}')
+cfg_data = datasetting.cfg_data
 
-TEST_CONFIG = TestConfig(
-    model_path=None,  # For example: Path("exp/<experiment>/epoch_020.pt")
-    gpu_id=0,
-)
+net_name = cfg.NET
+gpu_id = [0]
 
+visible = True
+vis_freq = 1 
+attn_visible = False
+attn_vis_freq = 20 
 
-def load_checkpoint_weights(path):
-    # NWPU-MOC checkpoints may include NumPy metrics in their training record.
-    numpy_globals = [
-        np.ndarray, np.dtype, multiarray.scalar, multiarray._reconstruct,
-        (multiarray.scalar, "numpy.core.multiarray.scalar"),
-        (multiarray._reconstruct, "numpy.core.multiarray._reconstruct"),
-        *(type(np.dtype(dtype)) for dtype in (np.float32, np.float64, np.int32, np.int64)),
-    ]
-    with torch.serialization.safe_globals(numpy_globals):
-        checkpoint = torch.load(path, weights_only=True, map_location="cpu")
-    state = checkpoint.get("net", checkpoint) if isinstance(checkpoint, Mapping) else checkpoint
-    if not isinstance(state, Mapping) or not state or not all(isinstance(key, str) for key in state):
-        raise ValueError(f"Expected a model state_dict or a checkpoint containing 'net': {path}")
+pos_embedding = False
 
-    def strip_parallel(key):
-        return ".".join(part for part in key.split(".") if part != "module")
+categorys = cfg_data.CATEGORYS
+log_para = cfg_data.LOG_PARA
+label_factor = cfg_data.LABEL_FACTOR
 
-    normalized = OrderedDict((strip_parallel(key), value) for key, value in state.items())
-    if len(normalized) != len(state):
-        raise ValueError(f"Duplicate model keys after removing DataParallel prefixes: {path}")
-    metadata = {strip_parallel(key): value for key, value in getattr(state, "_metadata", {}).items()}
+test_size = cfg.TRAIN_SIZE
 
-    # A saved Counter contains the MCC weights under network.; NWPU's CC uses CCN.
-    prefixes = [prefix for prefix in ("network", "CCN") if any(key.startswith(prefix + ".") for key in normalized)]
-    if len(prefixes) > 1:
-        raise ValueError(f"Checkpoint contains both network and CCN weights: {path}")
-    if prefixes:
-        prefix = prefixes[0]
-        normalized = OrderedDict(
-            (key[len(prefix) + 1:], value) for key, value in normalized.items() if key.startswith(prefix + ".")
-        )
-        metadata = {
-            key[len(prefix) + 1:]: value for key, value in metadata.items()
-            if key == prefix or key.startswith(prefix + ".")
-        }
-    normalized._metadata = metadata
-    return normalized
-
-
-def run_test(settings):
-    if settings.model_path is None:
-        raise ValueError("Set TEST_CONFIG.model_path to an existing MCC checkpoint in test.py")
-    if type(settings.gpu_id) is not int or settings.gpu_id < 0:
-        raise ValueError("Set TEST_CONFIG.gpu_id to a nonnegative CUDA device index")
-    if settings.split not in ("val", "test"):
-        raise ValueError("Set TEST_CONFIG.split to 'val' or 'test'")
-    if settings.eval_samples is not None and settings.eval_samples < 1:
-        raise ValueError("TEST_CONFIG.eval_samples must be positive when set")
-
-    checkpoint_path = (Path(PROJECT_ROOT_DIR) / settings.model_path).resolve()
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Missing trained MCC checkpoint: {checkpoint_path}")
-    experiment = next((parent for parent in checkpoint_path.parents if (parent / "config.json").is_file()), None)
-    if experiment is None:
-        raise FileNotFoundError(f"No experiment config.json found above checkpoint: {checkpoint_path}")
-    saved = json.loads((experiment / "config.json").read_text(encoding="utf-8"))
-    if "MODEL_ARCH" in saved:
-        variant = saved["MODEL_ARCH"]["backbone"]["variant"]
-        train_size = tuple(saved["TRAIN_SIZE"])
-        use_nir, bf16, seed = saved["MM"], saved["BF16"], saved["SEED"]
-        data_path, ovsam_root = saved["DATA_PATH"], saved["OVSAM_ROOT"]
-    else:
-        variant = saved["variant"]
-        train_size = (saved["crop_size"],) * 2
-        use_nir, bf16, seed = saved["nir"], saved["bf16"], saved["seed"]
-        data_path, ovsam_root = saved["data"], saved["ovsam"]
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    device = configure_device(settings.gpu_id, bf16, saved.get("ALLOW_TF32", cfg.ALLOW_TF32))
-
-    make_loader = createTestData if settings.split == "test" else createValData
-    loader = make_loader("MOC_RS", Dataset, make_dataset_config(data_path, train_size))
-    state = load_checkpoint_weights(checkpoint_path)
-    network = MCC(
-        build_encoder(ovsam_root, variant), cfg.MODEL_ARCH.backbone.channels[variant],
-        reference_size=train_size[0], use_nir=use_nir, use_masks="mask_head.weight" in state,
-    )
-    network.load_state_dict(state, strict=True)
-    del state
-    model = Counter(network, use_nir=use_nir).to(device)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output = experiment / f"{settings.split}_{timestamp}"
-    output.mkdir(exist_ok=False)
-    metrics = evaluate(model, loader, device, bf16, output, epoch=None, eval_samples=settings.eval_samples)
-    metrics["split"] = settings.split
-    metrics["checkpoint"] = checkpoint_path.relative_to(experiment).as_posix()
-    metrics["gpu_id"] = settings.gpu_id
-    print(json.dumps(metrics))
-    (output / "metrics.json").write_text(json.dumps([metrics], indent=2), encoding="utf-8")
-    plot_metrics(output, [metrics])
-
+mean_std_rgb = cfg_data.MEAN_STD_RGB
+mean_std_ir = cfg_data.MEAN_STD_IR
 
 def main():
-    run_test(TEST_CONFIG)
+    global save_path
+    if not model_path:
+        raise ValueError("Set model_path in test.py to an existing experiment checkpoint")
+    checkpoint = Path(model_path).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    experiment = next((parent for parent in checkpoint.parents if (parent / "model_config.json").is_file()),
+                      checkpoint.parent)
+    saved = experiment / "model_config.json"
+    if saved.is_file():
+        cfg.update(json.loads(saved.read_text(encoding="utf-8")))
+    else:
+        cfg.NET = net_name
+    if cfg.NET == "RWKVMCC" and len(gpu_id) != 1:
+        raise ValueError("RWKV-SAM requires exactly one test GPU")
+    torch.cuda.set_device(gpu_id[0])
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if cfg.SEED is not None:
+        np.random.seed(cfg.SEED)
+        torch.manual_seed(cfg.SEED)
+    save_path = experiment / f"test_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+    save_path.mkdir()
+    test_loader = datasets.loading_test_data(dataset)
+    net = CrowdCounter(cfg.NET, gpu_id, pretrained=False)
+    load_counter_weights(checkpoint, net)
+                       
+    print("__loading__test__model__")
+    net.eval()
+    test(net, test_loader)
+
+restore_transform_rgb = standard_transforms.Compose([
+        own_transforms.DeNormalize(*mean_std_rgb),
+        standard_transforms.ToPILImage()
+    ])
+
+restore_transform_t = standard_transforms.Compose([
+        own_transforms.DeNormalize(*mean_std_ir),
+        standard_transforms.ToPILImage()
+    ])
+
+   
 
 
-if __name__ == "__main__":
+def multi_class_gauss_map_generate(gt_map):
+    gs_layer = getattr(layer, 'Gaussianlayer')
+    gs = gs_layer()
+    if len(gpu_id) > 1:
+        gs = torch.nn.DataParallel(gs, device_ids=gpu_id).cuda()
+    else:
+        gs = gs.cuda()
+    class_gauss_maps = []
+    for i in range(len(categorys)):
+        class_gt_map = torch.unsqueeze(gt_map[:,i,:,:], 1)
+        class_gauss_map = torch.squeeze(gs(class_gt_map), 1)
+        class_gauss_maps.append(class_gauss_map)
+    gauss_map = torch.stack(class_gauss_maps,1)
+    return gauss_map
+
+def save_counting_results(pred_map, gt_map, record, index):
+    pred_map = pred_map.data.cpu().numpy()
+    gt_map = gt_map.data.cpu().numpy()
+    
+    for c_idx in range(len(categorys)):
+        pred_cnt = np.sum(pred_map[:,c_idx,:,:])/log_para
+        gt_count = np.sum(gt_map[:,c_idx,:,:])/log_para
+        print(categorys[c_idx], '   [cnt: gt: %.1f pred: %.2f]' % (gt_count, pred_cnt) )          
+        print(f'{index} {categorys[c_idx]} {gt_count:.1f} {pred_cnt:.4f}', file=record)
+        
+def test(net, test_loader):
+    
+    print('testing...')
+    # Iterate over data.
+    maes = AverageCategoryMeter(len(categorys))
+    mses = AverageCategoryMeter(len(categorys))
+    cmses = AverageMeter()
+    
+
+    record_path = os.path.join(save_path, 'record_results.txt')
+    record = open(record_path, 'w+')
+    
+    num_class = 6
+    
+    print(model_path)
+    print(model_path, file=record)
+    
+    for index, data in enumerate(test_loader, 0):
+        # get_local.clear()
+        print("test:",index,"/ ", len(test_loader))
+        for k, v in data.items(): # data to cuda
+            data[k] = v.cuda()
+        rgb, nir, gt_map = data['rgb'], data['nir'], data['gt_map'][:, :num_class, :, :]
+        
+        gauss_map = multi_class_gauss_map_generate(gt_map)
+
+        with torch.set_grad_enabled(False):
+            if pos_embedding:
+                b, c, h, w = rgb.shape
+                rh, rw = test_size
+
+                crop_RGBs, crop_Ts, crop_masks = [],[],[]
+
+                for i in range(0, h, rh): # i=0,256
+                    # (0,256),(224,480),crop blcok overlapping
+                    gis, gie = max(min(h-rh, i), 0), min(h, i+rh) 
+                    for j in range(0, w, rw):
+                        gjs, gje = max(min(w-rw, j), 0), min(w, j+rw)
+                        crop_RGBs.append(rgb[:, :, gis:gie, gjs:gje])
+                        crop_Ts.append(nir[:, :, gis:gie, gjs:gje])
+                        mask = torch.zeros(b, 1, h//label_factor, w//label_factor).cuda()
+                        mask[:, :, gis//label_factor:gie//label_factor, gjs//label_factor:gje//label_factor].fill_(1.0)
+                        crop_masks.append(mask)
+
+                crop_RGBs, crop_Ts, crop_masks = map(lambda x: torch.cat(x, dim=0), (crop_RGBs, crop_Ts, crop_masks))
+
+                crop_data = {'rgb': crop_RGBs, 'nir': crop_Ts,}
+                crop_outputs = net(crop_data, num_class, mode = 'test')
+                crop_preds = crop_outputs['pred_map']
+
+                h, w, rh, rw = h//label_factor, w//label_factor, rh//label_factor, rh//label_factor
+
+                idx = 0
+                pred_map = torch.zeros(b, num_class, h, w).cuda()
+                for i in range(0, h, rh):
+                    gis, gie = max(min(h-rh, i), 0), min(h, i+rh)
+                    for j in range(0, w, rw):
+                        gjs, gje = max(min(w-rw, j), 0), min(w, j+rw)
+                        pred_map[:, :, gis:gie, gjs:gje] += crop_preds[idx]
+                        idx += 1
+
+                mask = crop_masks.sum(dim=0)
+                pred_map = pred_map / mask
+
+            else:
+                outputs = net(data, num_class, mode = 'test')
+                pred_map = outputs['pred_map']            
+
+            abs_errors, square_errors, weights = eval_mc(pred_map, gt_map, log_para)
+
+            
+            wmse = 0.0
+            for c_idx in range(len(categorys)):
+                maes.update(abs_errors[c_idx], c_idx)
+                mses.update(square_errors[c_idx], c_idx)                         
+                wmse += square_errors[c_idx] * weights[c_idx]
+
+            cmses.update(wmse)
+               
+            save_counting_results(pred_map, gt_map, record, index)
+
+
+    N = len(test_loader)
+    overall_mae = maes.avg # list
+    overall_rmse = np.sqrt(mses.avg)
+    cls_weight_mse = cmses.avg
+
+    
+    cls_avg_mae = sum(overall_mae) / len(categorys)
+    cls_avg_rmse = sum(overall_rmse) / len(categorys)
+    save_metric_report(save_path, categorys, overall_mae, overall_rmse, cls_weight_mse)
+
+
+    log_str = 'Test{}, cls_avg_mae {cls_avg_mae:.4f} cls_avg_mse {cls_avg_rmse:.4f} cls_weight_mse {cls_weight_mse:.4f}'.\
+            format(N, cls_avg_mae=cls_avg_mae, cls_avg_rmse=cls_avg_rmse , cls_weight_mse=cls_weight_mse)
+
+    print(log_str)
+    print(log_str, file=record)
+
+    for c_idx in range(len(categorys)):
+        class_str = '{category}, mae: {mae:.4f} rmse: {rmse:.4f}'\
+                .format(category = categorys[c_idx], mae = overall_mae[c_idx], rmse = overall_rmse[c_idx])
+        print(class_str)
+        print(class_str, file=record)   
+    
+    print(model_path)
+    print(model_path, file=record)
+    
+    record.close()
+
+
+if __name__ == '__main__':
     main()

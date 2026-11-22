@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import os
-
-import numpy as np
 import scipy.io as scio
+import numpy as np
 from PIL import Image
-
+import random
+import torch
 
 def get_gt_dots(mat_path, img_height, img_width):
     """

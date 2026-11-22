@@ -1,311 +1,312 @@
-"""Train, evaluate and report the visual MOC-6 baseline."""
-from datetime import datetime
-from copy import copy
-from functools import partial
-from itertools import islice
-import json
-import math
-from pathlib import Path
-import random
-import shutil
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
+import json
+
 import torch
+from torch import optim
+from torch.autograd import Variable
 
-from config import cfg, LOSS_FUNCTIONS
-from datasets import createTrainData, createValData
-from datasets.basedataset import Dataset
+from models.CC import CrowdCounter
+from config import cfg
+from misc.utils import *
+import datasets
+
+from functools import partial
 from datasets.mask_supervision import MaskDataset, mask_collate
-from datasets.setting.MOC_RS import cfg_data
-from misc.utils import eval_mc, is_validation
-from models.backbone.rwkvsam import build_encoder, load_encoder
-from models.counter import Counter
-from models.counters.mcc import MCC
-from project import EXP_CODE_DIR_AND_FILE
+from torchvision.utils import make_grid
+from misc.utils import adjust_learning_rate, adjust_double_learning_rate
 
-CLASSES = tuple(name.capitalize() for name in cfg_data.CATEGORYS)
-DENSITY_SCALE = cfg_data.LOG_PARA
+class Trainer():
+    def __init__(self, cfg_data, pwd):
 
-
-def save_density(path, rgb, target, prediction, dots):
-    fig, axes = plt.subplots(3, 6, figsize=(16, 8), layout="constrained")
-    image = rgb[0].detach().cpu().permute(1, 2, 0).numpy()
-    mean, std = cfg_data.MEAN_STD_RGB
-    axes[0, 0].imshow(np.clip(image * std + mean, 0, 1))
-    axes[0, 0].set_title("RGB")
-    for i, name in enumerate(CLASSES):
-        truth = target[0, i].cpu().numpy()
-        pred = prediction[0, i].float().cpu().numpy()
-        limit = max(float(truth.max()), float(pred.max()), 1e-6)
-        axes[1, i].imshow(truth, vmin=0, vmax=limit)
-        y, x = np.nonzero(dots[0, i].cpu().numpy())
-        axes[1, i].scatter(x, y, s=2, c="white")
-        axes[1, i].set_title(f"{name} GT {truth.sum() / DENSITY_SCALE:.0f}")
-        axes[2, i].imshow(pred, vmin=0, vmax=limit)
-        axes[2, i].set_title(f"Pred {pred.sum() / DENSITY_SCALE:.2f}")
-    for axis in axes.flat:
-        axis.axis("off")
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
-def plot_metrics(directory, history):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), layout="constrained")
-    for axis, key in zip(axes, ("mae", "rmse"), strict=True):
-        axis.bar(CLASSES, history[-1][key])
-        axis.set_title(f"{key.upper()} · macro {history[-1]['mean_' + key]:.3f}")
-        axis.tick_params(axis="x", rotation=25)
-    fig.savefig(directory / "class_metrics.png", dpi=140)
-    plt.close(fig)
-    if len(history) > 1:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4), layout="constrained")
-        for axis, key in zip(axes, ("mae", "rmse"), strict=True):
-            for i, name in enumerate(CLASSES):
-                axis.plot([row["epoch"] for row in history], [row[key][i] for row in history], label=name)
-            axis.set(xlabel="Epoch", ylabel=key.upper())
-            axis.legend()
-        fig.savefig(directory / "class_trends.png", dpi=140)
-        plt.close(fig)
-
-
-@torch.inference_mode()
-def evaluate(model, loader, device, bf16, directory, epoch, eval_samples=None):
-    model.eval()
-    absolute, squared, weighted = [], [], []
-    predicted_counts, target_counts = [], []
-    for index, batch in enumerate(islice(loader, eval_samples)):
-        rgb = batch["rgb"]
-        dots = batch["gt_map"][:, :len(CLASSES)]
-        inputs = {"rgb": rgb.to(device)}
-        if model.use_nir:
-            inputs["nir"] = batch["nir"].to(device)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
-            outputs = model(inputs, mode="val")
-        density, counts = outputs["pred_map"], outputs["counts"]
-        if not torch.isfinite(density).all():
-            raise FloatingPointError(f"Non-finite evaluation density at sample {index}")
-        pred = density.cpu()
-        abs_errors, square_errors, weights = eval_mc(pred, dots, DENSITY_SCALE)
-        absolute.append(abs_errors)
-        squared.append(square_errors)
-        weighted.append(sum(error * weight for error, weight in zip(square_errors, weights, strict=True)))
-        predicted_counts.append(counts[0].cpu().numpy())
-        target_counts.append(dots[0].sum((-2, -1)).numpy() / DENSITY_SCALE)
-        if index == 0:
-            target = model.density_target(dots.to(device))
-            filename = "density.png" if epoch is None else f"density_epoch_{epoch:03}.png"
-            save_density(directory / filename, rgb, target, pred, dots)
-    mae = np.mean(absolute, axis=0)
-    rmse = np.sqrt(np.mean(squared, axis=0))
-    counts = np.asarray(predicted_counts)
-    positive = np.asarray(target_counts) > 0
-    positive_samples = positive.sum(axis=0)
-    positive_misses = ((counts < 0.5) & positive).sum(axis=0)
-    return {
-        "epoch": epoch, "samples": len(absolute), "classes": CLASSES,
-        "mae": mae.tolist(), "rmse": rmse.tolist(),
-        "mean_mae": float(mae.mean()), "mean_rmse": float(rmse.mean()),
-        "cls_weight_mse": float(np.mean(weighted)),
-        "mean_pred_count": counts.mean(axis=0).tolist(),
-        "exact_zero_rate": (counts == 0).mean(axis=0).tolist(),
-        "below_half_rate": (counts < 0.5).mean(axis=0).tolist(),
-        "gt_positive_samples": positive_samples.tolist(),
-        "gt_positive_below_half_rate": [
-            float(missed / total) if total else None
-            for missed, total in zip(positive_misses, positive_samples, strict=True)
-        ],
-    }
-
-
-def train_epoch(model, loader, optimizer, settings, device, log, epoch):
-    model.train()
-    if settings.BACKBONE_FREEZE:
-        model.network.encoder.eval()
-    for index, batch in enumerate(loader):
-        batch = {key: value.to(device) for key, value in batch.items() if key != "nir" or model.use_nir}
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=settings.BF16):
-            outputs = model(batch, mode="train")
-        loss = model.loss
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite loss at epoch {epoch}, batch {index}")
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), error_if_nonfinite=True)
-        optimizer.step()
-        record = {
-            "epoch": epoch, "step": index + 1,
-            "loss": loss.item(), "loss_function": model.loss_function,
-            "grad_norm": norm.item(),
-            "gt": (batch["gt_map"][:, :len(CLASSES)].sum((-2, -1)) / DENSITY_SCALE).tolist(),
-            "pred": outputs["counts"].detach().tolist(),
-        }
-        if model.loss_function == "Mse_loss":
-            record["density_mse"] = record["loss"]
-        print(json.dumps(record), file=log, flush=True)
-        if (index + 1) % settings.PRINT_FREQ == 0 or settings.MAX_STEPS is not None:
-            print(json.dumps(record))
-        if settings.MAX_STEPS is not None and index + 1 >= settings.MAX_STEPS:
-            break
-
-
-def configure_device(gpu_id, bf16, allow_tf32=cfg.ALLOW_TF32):
-    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-    torch.backends.cudnn.allow_tf32 = allow_tf32
-    device = torch.device("cuda", gpu_id)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Upstream VRWKV requires a CUDA-enabled PyTorch environment")
-    if device.index is not None and device.index >= torch.cuda.device_count():
-        raise ValueError(f"Requested {device}, but only {torch.cuda.device_count()} CUDA device(s) are visible")
-    torch.cuda.set_device(device)
-    if bf16 and not torch.cuda.is_bf16_supported():
-        raise RuntimeError("BF16 is unavailable on the selected GPU")
-    return device
-
-
-def save_code_snapshot(output):
-    output = output.resolve()
-    snapshot = output / "code"
-    snapshot.mkdir()
-
-    def ignore_generated(directory, names):
-        return {
-            name for name in names
-            if name == "__pycache__" or name.endswith(".pyc") or Path(directory, name).resolve() == output
-        }
-
-    for source in map(Path, EXP_CODE_DIR_AND_FILE):
-        target = snapshot / source.name
-        if source.is_dir():
-            shutil.copytree(source, target, ignore=ignore_generated)
+        self.cfg_data = cfg_data
+        if cfg.LOSS_FUNCTION == "Mask_loss":
+            if cfg.NET != "RWKVMCC" or not cfg.MASK_DIR:
+                raise ValueError("Mask_loss requires RWKVMCC and cfg.MASK_DIR")
+            dataset = partial(MaskDataset, mask_dir=cfg.MASK_DIR)
+            self.train_loader = datasets.createTrainData(cfg.DATASET, dataset, cfg_data)
+            self.train_loader.collate_fn = mask_collate
+            self.val_loader = datasets.createValData(cfg.DATASET, datasets.basedataset.Dataset, cfg_data)
         else:
-            shutil.copy2(source, target)
+            self.train_loader, self.val_loader = datasets.loading_data(cfg.DATASET)
+
+        self.data_mode = cfg.DATASET
+        self.exp_name = cfg.EXP_NAME
+        self.exp_path = cfg.EXP_PATH
+        self.pwd = pwd
+
+        self.net_name = cfg.NET
+        self.gpu_id = cfg.GPU_ID
+
+        self.writer, self.log_txt = logger(self.exp_path, self.exp_name, self.pwd, 'exp', resume=cfg.RESUME) 
+        with open(os.path.join(self.exp_path, self.exp_name, "model_config.json"), "w", encoding="utf-8") as f:
+            json.dump({key: cfg[key] for key in ("NET", "MM", "LOSS_FUNCTION", "TRAIN_SIZE", "RWKV_ARCH")},
+                      f, indent=2)
+
+        self.net = CrowdCounter(self.net_name, self.gpu_id, pretrained=not (cfg.RESUME or cfg.PRE_GCC))
+        
+        self.categorys = self.cfg_data.CATEGORYS
+        self.num_classes = len(self.categorys)
+
+        self.backbone = self.net.CCN.backbone if cfg.NET == "RWKVMCC" else None
+        if self.backbone is not None and cfg.BACKBONE_FREEZE:
+            self.backbone.requires_grad_(False)
+        self.use_backbone_lr = cfg.NET == "RWKVMCC" or cfg.BACKBONE_FREEZE
+        if self.use_backbone_lr:
+            self.optimizer = optim.AdamW([
+                {'params': [param for name, param in self.net.named_parameters() if 'backbone' in name], 'lr': cfg.CONV_LR, 'weight_decay': cfg.WEIGHT_DECAY},
+                {'params': [param for name, param in self.net.named_parameters() if 'backbone' not in name], 'lr': cfg.BASE_LR, 'weight_decay': cfg.WEIGHT_DECAY},
+            ])
+        else:
+            self.optimizer = optim.AdamW(self.net.parameters(), lr=cfg.BASE_LR, weight_decay=cfg.WEIGHT_DECAY)
+
+        self.train_record = {'best_cls_avg_mae': 1e20, 'best_cls_avg_mse':1e20, 'best_cls_weight_mse':1e20, 'best_model_name': ''}
+        self.timer = {'iter time' : Timer(),'train time' : Timer(),'val time' : Timer()} 
+
+        self.epoch = 0
+        self.i_tb = 0
+        steps = len(self.train_loader)
+        if cfg.MAX_STEPS is not None:
+            steps = min(steps, cfg.MAX_STEPS)
+        self.num_iters = cfg.MAX_EPOCH * steps
+        self.train_loss_avg = 0
+        self.val_loss_avg = 0
+        
+        if cfg.PRE_GCC:
+            self.net.load_state_dict(torch.load(cfg.PRE_GCC_MODEL))
+
+        if cfg.RESUME:
+            from checkpoint import read_checkpoint
+            latest_state = read_checkpoint(cfg.RESUME_PATH)
+            self.net.load_state_dict(latest_state['net'])
+            self.optimizer.load_state_dict(latest_state['optimizer'])
+            self.epoch = latest_state['epoch'] + 1
+            self.i_tb = latest_state['i_tb']
+            self.num_iters = latest_state['num_iters']
+            self.train_record = latest_state['train_record']
+            self.exp_path = latest_state['exp_path']
+            self.exp_name = latest_state['exp_name']
 
 
-def validate_config(settings):
-    if settings.DATASET != "MOC_RS" or settings.NET != "MCC":
-        raise ValueError("Use cfg.DATASET='MOC_RS' and cfg.NET='MCC'")
-    if len(settings.GPU_ID) != 1 or type(settings.GPU_ID[0]) is not int or settings.GPU_ID[0] < 0:
-        raise ValueError("cfg.GPU_ID must contain one nonnegative CUDA device ID")
-    if settings.RESUME and not settings.RESUME_PATH:
-        raise ValueError("Set cfg.RESUME_PATH when cfg.RESUME is True")
-    if not settings.RESUME and not settings.PRE_BACKBONE_WEIGHT:
-        raise ValueError("Set cfg.PRE_BACKBONE_WEIGHT in config.py")
-    backbone = settings.MODEL_ARCH.backbone
-    if backbone.variant not in backbone.channels:
-        raise ValueError(f"Unknown encoder variant: {backbone.variant}")
-    height, width = settings.TRAIN_SIZE
-    if height != width or height < backbone.input_size_multiple or height % backbone.input_size_multiple:
-        raise ValueError(f"cfg.TRAIN_SIZE must be square and divisible by {backbone.input_size_multiple}")
-    if settings.VAL_SAMPLES is not None and settings.VAL_SAMPLES < 1:
-        raise ValueError("cfg.VAL_SAMPLES must be positive when set")
-    if settings.LOSS_FUNCTION not in LOSS_FUNCTIONS:
-        raise ValueError(f"Unknown loss function: {settings.LOSS_FUNCTION}")
-    if settings.LOSS_FUNCTION == "Mask_loss" and not settings.MASK_DIR:
-        raise ValueError("Set cfg.MASK_DIR in config.py for Mask_loss")
-    if settings.MAX_EPOCH < 1 or settings.TRAIN_BATCH_SIZE < 1 or (settings.MAX_STEPS is not None and settings.MAX_STEPS < 1):
-        raise ValueError("MAX_EPOCH, TRAIN_BATCH_SIZE and MAX_STEPS must be positive when set")
-    if settings.PRINT_FREQ < 1 or settings.CP_FREQ < 1:
-        raise ValueError("cfg.PRINT_FREQ and cfg.CP_FREQ must be positive")
-    if (
-        not settings.VAL_STAGE or settings.VAL_STAGE[0] != 0
-        or sorted(set(settings.VAL_STAGE)) != list(settings.VAL_STAGE)
-        or len(settings.VAL_STAGE) != len(settings.VAL_FREQ) or min(settings.VAL_FREQ) < 1
-    ):
-        raise ValueError("Use increasing VAL_STAGE values starting at 0 and one positive VAL_FREQ per stage")
-    for name in ("CONV_LR", "BASE_LR", "WEIGHT_DECAY", "alpha"):
-        value = settings[name]
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"cfg.{name} must be finite and nonnegative")
+    def forward(self):
+
+        # self.validate()
+        for epoch in range(self.epoch,cfg.MAX_EPOCH):
+            self.epoch = epoch
+            record_path = os.path.join(self.exp_path, self.exp_name, 'log.txt')
+            record = open(record_path, 'a+')
+
+            # training    
+            self.timer['train time'].tic()
+            self.train()
+            self.timer['train time'].toc(average=False)
+
+            print( 'train time: {:.2f}s'.format(self.timer['train time'].diff) )
+            print( 'train time: {:.2f}s'.format(self.timer['train time'].diff), file=record )
+            if self.epoch % cfg.CP_FREQ == 0 or self.epoch + 1 == cfg.MAX_EPOCH:
+                save_checkpoint(self)
+            print( '='*20 )
+            print( '='*20, file=record )
+
+            self.writer.add_scalar('train_loss_avg', self.train_loss_avg, self.epoch)
+            self.train_loss_avg = 0
+            
+            # validation
+            if is_validation(cfg.VAL_STAGE,cfg.VAL_FREQ,self.epoch):
+                self.timer['val time'].tic()
+                self.validate() # only when pos_emb = False
+                self.timer['val time'].toc(average=False)
+                print( 'val time: {:.2f}s'.format(self.timer['val time'].diff) )
+                print( 'val time: {:.2f}s'.format(self.timer['val time'].diff), file=record  )
+                self.writer.add_scalar('val_loss_avg', self.val_loss_avg, self.epoch)
+                self.val_loss_avg = 0
+          
+            record.close()
+            
+    def train(self): # training for all datasets
+        
+        self.net.train()
+        if self.backbone is not None and cfg.BACKBONE_FREEZE:
+            self.backbone.eval()
+        
+        train_losses = AverageMeter()
+        
+        for it, data in enumerate(self.train_loader, 0):
+            self.i_tb += 1
+            self.timer['iter time'].tic()
+            for k, v in data.items(): # data to cuda
+                data[k] = v.cuda()
+
+            num_class = self.num_classes
+            rgb, nir, gt_map = data['rgb'], data['nir'], data['gt_map'][:, :num_class, :, :]
+
+            self.optimizer.zero_grad()
+
+            # input_grid = make_grid([rgb[0],nir[0]], nrow=2, normalize=True, scale_each=True)
+            # self.writer.add_image("inputs", input_grid, it)
+
+            outputs = self.net(data, num_class, it)
+            pred_map = outputs['pred_map']
+            gauss_map = outputs['gauss_map']
+            
+            
+            output_list = list()
+            # for c_idx in range(self.num_classes):
+            #     output_list.extend([gt_map[0][c_idx].unsqueeze(dim=0), \
+            #                         gauss_map[0][c_idx].unsqueeze(dim=0), \
+            #                         pred_map[0][c_idx].unsqueeze(dim=0)])
+            # output_grid = make_grid(output_list, nrow=4, normalize=True, scale_each=True)#排列图像
+            # self.writer.add_image("outputs", output_grid, it)
+
+            loss = self.net.loss
+            loss.backward()
+            self.optimizer.step()
+            
+            train_losses.update(loss.item())
+            
+            if self.use_backbone_lr:
+                base_lr, conv_lr = adjust_double_learning_rate(self.optimizer, self.i_tb, self.num_iters, base_lr=cfg.BASE_LR, conv_lr = cfg.CONV_LR)
+            else:
+                base_lr = adjust_learning_rate(self.optimizer, self.i_tb, self.num_iters, lr=cfg.BASE_LR)
+                
+            record_path = os.path.join(self.exp_path, self.exp_name, 'log.txt')
+            record = open(record_path, 'a+')
+
+            if (it + 1) % cfg.PRINT_FREQ == 0:
+                self.writer.add_scalar('train_base_lr', base_lr, self.i_tb)
+                self.writer.add_scalar('train_loss', loss.item(), self.i_tb)
+                self.timer['iter time'].toc(average=False)
+
+                if self.use_backbone_lr:
+                    print( '[ep %d][it %d][loss %.4f][conv_lr %.8f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.optimizer.param_groups[1]['lr'], self.timer['iter time'].diff) )
+                    print( '[ep %d][it %d][loss %.4f][conv_lr %.8f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.optimizer.param_groups[1]['lr'], self.timer['iter time'].diff), file=record )
+                
+                else:      
+                    print( '[ep %d][it %d][loss %.4f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.timer['iter time'].diff) )
+                    print( '[ep %d][it %d][loss %.4f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.timer['iter time'].diff), file=record )
+                for c_idx in range(self.num_classes):
+                    print( '       ', self.categorys[c_idx],':  [cnt: gt: %.1f pred: %.2f]' % (gt_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA, pred_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA) ) 
+                    print( '       ', self.categorys[c_idx],':  [cnt: gt: %.1f pred: %.2f]' % (gt_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA, pred_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA), file=record ) 
+            record.close()
+            if cfg.MAX_STEPS is not None and it + 1 >= cfg.MAX_STEPS:
+                break
+
+        self.train_loss_avg = train_losses.avg
+
+    def validate(self): 
+        
+        self.net.eval()  
 
 
-def make_dataset_config(data_path, train_size=None, batch_size=None):
-    data_config = copy(cfg_data)
-    data_config.DATA_PATH = str(data_path)
-    if train_size is not None:
-        data_config.TRAIN_SIZE = tuple(train_size)
-    if batch_size is not None:
-        data_config.TRAIN_BATCH_SIZE = batch_size
-    return data_config
+        val_losses = AverageMeter()
+        maes = AverageCategoryMeter(self.num_classes)
+        mses = AverageCategoryMeter(self.num_classes)
+        cmses = AverageMeter()
 
 
-def run(settings):
-    validate_config(settings)
-    random.seed(settings.SEED)
-    np.random.seed(settings.SEED)
-    torch.manual_seed(settings.SEED)
-    device = configure_device(settings.GPU_ID[0], settings.BF16, settings.ALLOW_TF32)
+        for index, data in enumerate(self.val_loader, 0):
+            for k, v in data.items(): # data to cuda
+                data[k] = v.cuda()
+            
+            num_class = self.num_classes    
+            rgb, nir, gt_map = data['rgb'], data['nir'], data['gt_map'][:, :num_class, :, :]
 
-    data_config = make_dataset_config(settings.DATA_PATH, settings.TRAIN_SIZE, settings.TRAIN_BATCH_SIZE)
-    val_loader = createValData(settings.DATASET, Dataset, data_config)
-    val_loader.dataset[0]
-    loss_function = settings.LOSS_FUNCTION
-    use_masks = loss_function == "Mask_loss"
-    dataset_type = partial(MaskDataset, mask_dir=settings.MASK_DIR) if use_masks else Dataset
-    train_loader = createTrainData(settings.DATASET, dataset_type, data_config)
-    if use_masks:
-        train_loader.collate_fn = mask_collate
-    train_loader.dataset[0]
-    if not len(train_loader):
-        raise ValueError("cfg.TRAIN_BATCH_SIZE exceeds the training split size")
-    random.seed(settings.SEED)
+            with torch.set_grad_enabled(False):
+                if cfg.POS_EMBEDDING:
+                    b, c, h, w = rgb.shape
+                    rh, rw = self.cfg_data.TRAIN_SIZE
 
-    backbone = settings.MODEL_ARCH.backbone
-    checkpoint = None
-    first_epoch = 1
-    if settings.RESUME:
-        checkpoint = torch.load(settings.RESUME_PATH, weights_only=True, map_location="cpu")
-        first_epoch = checkpoint["epoch"] + 1
-        if first_epoch > settings.MAX_EPOCH:
-            raise ValueError("cfg.MAX_EPOCH must exceed the completed checkpoint epoch")
-        encoder = build_encoder(settings.OVSAM_ROOT, backbone.variant)
-    else:
-        encoder = load_encoder(settings.OVSAM_ROOT, settings.PRE_BACKBONE_WEIGHT, backbone.variant)
-    if settings.BACKBONE_FREEZE:
-        encoder.requires_grad_(False)
-    network = MCC(
-        encoder, backbone.channels[backbone.variant], reference_size=settings.TRAIN_SIZE[0],
-        use_nir=settings.MM, use_masks=use_masks,
-    )
-    model = Counter(network, loss_function, settings.alpha, use_nir=settings.MM).to(device)
-    optimizer = torch.optim.AdamW([
-        {"params": network.encoder.parameters(), "lr": settings.CONV_LR},
-        {"params": [parameter for name, parameter in network.named_parameters() if not name.startswith("encoder.")],
-         "lr": settings.BASE_LR},
-    ], weight_decay=settings.WEIGHT_DECAY)
-    if checkpoint is not None:
-        network.load_state_dict(checkpoint["net"], strict=True)
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        del checkpoint
+                    crop_RGBs, crop_Ts, crop_masks = [],[],[] # mask是用来记录overlapping的部分重叠过几次的
 
-    history = []
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    exp_name = settings.EXP_NAME or (
-        f"{timestamp}_{settings.DATASET}_MCC_{backbone.variant}_loss_{loss_function}"
-        f"_alpha_{settings.alpha:g}_base_lr_{settings.BASE_LR:g}_NIR={settings.MM}"
-    )
-    output = Path(settings.EXP_PATH) / exp_name
-    output.mkdir(parents=True, exist_ok=False)
-    save_code_snapshot(output)
-    snapshot = dict(settings) | {
-        "DATA_PATH": Path(settings.DATA_PATH).resolve(),
-        "OVSAM_ROOT": Path(settings.OVSAM_ROOT).resolve(),
-        "EXP_PATH": output.parent.resolve(),
-        "EXP_NAME": output.name,
-    }
-    (output / "config.json").write_text(json.dumps(snapshot, default=str, indent=2), encoding="utf-8")
-    with (output / "train.jsonl").open("w", encoding="utf-8") as log:
-        for epoch in range(first_epoch, settings.MAX_EPOCH + 1):
-            train_epoch(model, train_loader, optimizer, settings, device, log, epoch)
-            state = network.state_dict()
-            torch.save(state, output / "latest.pt")
-            if epoch % settings.CP_FREQ == 0 or epoch == settings.MAX_EPOCH:
-                torch.save({"net": state, "optimizer": optimizer.state_dict(), "epoch": epoch},
-                           output / f"epoch_{epoch:03d}.pth")
-            if is_validation(settings.VAL_STAGE, settings.VAL_FREQ, epoch - 1):
-                history.append(evaluate(model, val_loader, device, settings.BF16, output, epoch, settings.VAL_SAMPLES))
-                print(json.dumps(history[-1]))
-                (output / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-                plot_metrics(output, history)
+                    for i in range(0, h, rh): # i=0,256
+                        # (0,256),(224,480),crop blcok overlapping
+                        gis, gie = max(min(h-rh, i), 0), min(h, i+rh) 
+                        for j in range(0, w, rw):
+                            gjs, gje = max(min(w-rw, j), 0), min(w, j+rw)
+                            crop_RGBs.append(rgb[:, :, gis:gie, gjs:gje])
+                            crop_Ts.append(nir[:, :, gis:gie, gjs:gje])
+                            mask = torch.zeros(b, 1, h//self.cfg_data.LABEL_FACTOR, w//self.cfg_data.LABEL_FACTOR).cuda()
+                            mask[:, :, gis//self.cfg_data.LABEL_FACTOR:gie//self.cfg_data.LABEL_FACTOR, gjs//self.cfg_data.LABEL_FACTOR:gje//self.cfg_data.LABEL_FACTOR].fill_(1.0)
+                            crop_masks.append(mask)
+
+                    crop_RGBs, crop_Ts, crop_masks = map(lambda x: torch.cat(x, dim=0), (crop_RGBs, crop_Ts, crop_masks))
+
+                    crop_data = {'rgb': crop_RGBs, 'nir': crop_Ts,}
+                    crop_outputs = self.net(crop_data, num_class, mode='val')
+                    crop_preds = crop_outputs['pred_map']
+
+                    h, w, rh, rw = h//self.cfg_data.LABEL_FACTOR, w//self.cfg_data.LABEL_FACTOR, rh//self.cfg_data.LABEL_FACTOR, rh//self.cfg_data.LABEL_FACTOR
+
+                    idx = 0
+                    pred_map = torch.zeros(b, num_class, h, w).cuda()
+                    for i in range(0, h, rh):
+                        gis, gie = max(min(h-rh, i), 0), min(h, i+rh)
+                        for j in range(0, w, rw):
+                            gjs, gje = max(min(w-rw, j), 0), min(w, j+rw)
+                            pred_map[:, :, gis:gie, gjs:gje] += crop_preds[idx]
+                            idx += 1
+
+                    mask = crop_masks.sum(dim=0)
+                    pred_map = pred_map / mask
+
+                else:
+                    outputs = self.net(data, num_class, mode = 'val')
+                    pred_map = outputs['pred_map']
+
+                target = self.net.multi_class_gauss_map_generate(gt_map)
+                val_losses.update(torch.nn.functional.mse_loss(pred_map, target).item())
+                
+                # abs_errors, square_errors = eval(pred_map, gt_map, self.cfg_data.LOG_PARA)
+                abs_errors, square_errors, weights = eval_mc(pred_map, gt_map, self.cfg_data.LOG_PARA)
+                wmse = 0.0
+                for c_idx in range(self.num_classes):
+                    maes.update(abs_errors[c_idx], c_idx)
+                    mses.update(square_errors[c_idx], c_idx)
+                    wmse += square_errors[c_idx] * weights[c_idx]
+
+
+                cmses.update(wmse)
+            if cfg.VAL_SAMPLES is not None and index + 1 >= cfg.VAL_SAMPLES:
+                break
+                
+        N = val_losses.count
+        self.val_loss_avg = val_losses.avg
+        overall_mae = maes.avg # list
+        # RMSE ??
+        overall_rmse = np.sqrt(mses.avg) 
+        cls_weight_mse = cmses.avg
+        
+        cls_avg_mae = sum(overall_mae) / self.num_classes
+        cls_avg_rmse = sum(overall_rmse) / self.num_classes
+        save_metric_report(os.path.join(self.exp_path, self.exp_name), self.categorys, overall_mae,
+                           overall_rmse, cls_weight_mse, epoch=self.epoch + 1)
+
+        self.writer.add_scalar('val_loss', self.val_loss_avg, self.epoch + 1)
+        self.writer.add_scalar('cls_weight_mse', cls_weight_mse, self.epoch + 1)
+        self.writer.add_scalar('cls_avg_mae', cls_avg_mae, self.epoch + 1)
+        self.writer.add_scalar('cls_avg_rmse', cls_avg_rmse, self.epoch + 1)
+
+        self.train_record = update_model(self.net,self.optimizer,self.epoch,self.i_tb,self.exp_path,self.exp_name, \
+            [self.val_loss_avg, overall_mae, overall_rmse, cls_avg_mae, cls_avg_rmse, cls_weight_mse], self.train_record, self.log_txt, self.categorys)
+
+        record_path = os.path.join(self.exp_path, self.exp_name, 'log.txt')
+        record = open(record_path, 'a+')
+        
+        log_str = 'Val{}, val_loss {val_loss:.4f} cls_avg_mae {cls_avg_mae:.4f} cls_avg_rmse {cls_avg_rmse:.4f} cls_weight_mse {cls_weight_mse:.4f}'.\
+                format(N, val_loss=self.val_loss_avg, cls_avg_mae=cls_avg_mae, cls_avg_rmse=cls_avg_rmse,  cls_weight_mse=cls_weight_mse)
+        
+        print(log_str)
+        print(log_str, file=record)
+        
+        for c_idx in range(self.num_classes):
+
+          
+            class_str = '{category}, mae: {mae:.4f} rmse: {rmse:.4f}'\
+                .format(category = self.categorys[c_idx], mae = overall_mae[c_idx], rmse = overall_rmse[c_idx])
+            print(class_str)
+            print(class_str, file=record)   
+        
+        record.close()

@@ -25,7 +25,7 @@ def build_encoder(root, variant):
         spec = importlib.util.spec_from_file_location("_sam_moc_vitamin", source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        backbone = cfg.MODEL_ARCH.backbone
+        backbone = cfg.RWKV_ARCH.backbone
         return module.VITAMINBackbone(
             model_variant=variant,
             attn_type=backbone.attn_type,

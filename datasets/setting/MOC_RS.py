@@ -1,5 +1,4 @@
 from easydict import EasyDict as edict
-
 from config import cfg
 
 # init
@@ -8,7 +7,7 @@ __C_MOC_RS = edict()
 cfg_data = __C_MOC_RS
 
 __C_MOC_RS.TRAIN_SIZE = cfg.TRAIN_SIZE
-__C_MOC_RS.DATA_PATH = 'NWPU-MOC'
+__C_MOC_RS.DATA_PATH = cfg.DATA_PATH
 __C_MOC_RS.TRAIN_LST = 'train.txt'
 __C_MOC_RS.VAL_LST =  'val.txt'
 __C_MOC_RS.TEST_LST =  'test.txt'
