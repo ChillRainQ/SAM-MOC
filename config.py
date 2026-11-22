@@ -16,25 +16,26 @@ __C.DATASET = 'MOC_RS' # dataset selection: RGBT, DRONERGBT, GCC, SHHA, SHHB, UC
 #是否使用NIR
 __C.MM = False
 
-__C.NET = 'RWKVMCC'  # Use 'MCC' for the original Swin baseline
+__C.NET = 'SAM2MCC'  # Use 'MCC' for the original Swin baseline
 
 
-__C.PRE_BACKBONE_WEIGHT = ''  # Matching RWKV-SAM pretrained checkpoint
-__C.OVSAM_ROOT = Path(__file__).resolve().parent / "third_party" / "ovsam"
+__C.PRE_BACKBONE_WEIGHT = Path(__file__).resolve().parent / "pretrained_models" / "sam2.1_hiera_large.pt"
 __C.DATA_PATH = os.environ.get("NWPU_MOC_ROOT", str(Path(__file__).resolve().parent / "NWPU-MOC"))
 __C.MAX_STEPS = None
 __C.VAL_SAMPLES = None
 
-__C.RWKV_ARCH = edict(
+__C.SAM2_ARCH = edict(
     backbone=dict(
-        variant="large",
-        channels={"tiny": (32, 64, 192), "small": (64, 128, 384), "large": (160, 320, 1024)},
-        attn_type="rwkv",
-        attn_cfg={"depth": 14, "mlp_ratio": 2},
-        with_pos_embd=False,
-        additional_final_layers=False,
-        out_indices=(0, 1, -1),
-        strides=(4, 8, 16),
+        hiera=dict(
+            embed_dim=144,
+            num_heads=2,
+            stages=(2, 6, 36, 4),
+            global_att_blocks=(23, 33, 43),
+            window_pos_embed_bkg_spatial_size=(7, 7),
+            window_spec=(8, 4, 16, 8),
+        ),
+        channels=(144, 288, 576, 1152),
+        input_multiple=32,
     ),
     fpn=dict(width=128),
     decode_head=dict(width=64),

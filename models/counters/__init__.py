@@ -1,2 +1,2 @@
 from . import MCC
-from . import RWKVMCC
+from . import SAM2MCC

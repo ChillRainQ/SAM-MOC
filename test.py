@@ -64,8 +64,6 @@ def main():
         cfg.update(json.loads(saved.read_text(encoding="utf-8")))
     else:
         cfg.NET = net_name
-    if cfg.NET == "RWKVMCC" and len(gpu_id) != 1:
-        raise ValueError("RWKV-SAM requires exactly one test GPU")
     torch.cuda.set_device(gpu_id[0])
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

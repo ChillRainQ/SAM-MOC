@@ -63,7 +63,7 @@ class CrowdCounter(nn.Module):
         nir = nir[:,0,:,:].unsqueeze(1) 
      
         pred_mask_maps = None
-        if self.net_name == 'RWKVMCC':
+        if self.net_name == 'SAM2MCC':
             nir = nir if self.MM else None
             if mode == 'train' and cfg.LOSS_FUNCTION == 'Mask_loss':
                 pred_map, masks = self.CCN(rgb, nir, return_mask=True)
@@ -106,7 +106,7 @@ class CrowdCounter(nn.Module):
             
             elif cfg.LOSS_FUNCTION == 'Mask_loss':
                 if pred_mask_maps is None:
-                    raise ValueError("Mask_loss requires the RWKVMCC mask head")
+                    raise ValueError("Mask_loss requires the SAM2MCC mask head")
                 if 'mask_map' not in data:
                     raise ValueError("Mask_loss requires a training batch with binary mask_map targets")
                 mask_map = data['mask_map']

@@ -29,7 +29,7 @@ class Trainer():
 
         self.writer, self.log_txt = logger(self.exp_path, self.exp_name, self.pwd, 'exp', resume=cfg.RESUME) 
         with open(os.path.join(self.exp_path, self.exp_name, "model_config.json"), "w", encoding="utf-8") as f:
-            json.dump({key: cfg[key] for key in ("NET", "MM", "LOSS_FUNCTION", "TRAIN_SIZE", "RWKV_ARCH", "BASE_LR", "CONV_LR")},
+            json.dump({key: cfg[key] for key in ("NET", "MM", "LOSS_FUNCTION", "TRAIN_SIZE", "SAM2_ARCH", "BASE_LR", "CONV_LR")},
                       f, indent=2)
 
         self.net = CrowdCounter(self.net_name, self.gpu_id, pretrained=not (cfg.RESUME or cfg.PRE_GCC))
@@ -40,7 +40,7 @@ class Trainer():
         model = self.net.CCN
         if isinstance(model, torch.nn.DataParallel):
             model = model.module
-        self.backbone = model.backbone if self.net_name == "RWKVMCC" else model.Extractor
+        self.backbone = model.Extractor if self.net_name == "MCC" else model.backbone
         if cfg.BACKBONE_FREEZE:
             self.backbone.requires_grad_(False)
         backbone_params = list(self.backbone.parameters())

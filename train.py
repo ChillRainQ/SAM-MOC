@@ -8,8 +8,6 @@ def main():
     import numpy as np
     import torch
 
-    if cfg.NET == "RWKVMCC" and len(cfg.GPU_ID) != 1:
-        raise ValueError("RWKV-SAM requires exactly one CUDA device in cfg.GPU_ID")
     if not torch.cuda.is_available():
         raise RuntimeError("Training requires CUDA-enabled PyTorch")
     if any(index < 0 or index >= torch.cuda.device_count() for index in cfg.GPU_ID):

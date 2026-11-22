@@ -1,10 +1,18 @@
-## RWKV-SAM counting on the NWPU branch
+## SAM 2.1 counting on the NWPU branch
 
-This branch keeps the NWPU-MOC trainer, dataset pipeline, losses and evaluator. `cfg.NET = 'RWKVMCC'` selects the RWKV-SAM image encoder with the original MCC counting path (three-level FPN, P3 alignment, channel reduction and `SCAModule`). `cfg.NET = 'MCC'` selects the original Swin model.
+`cfg.NET = 'SAM2MCC'` uses the SAM 2.1 Hiera Large backbone. All four Hiera levels feed the NWPU FPN. The stride 4, 8, and 16 FPN outputs are aligned and passed to the original MCC channel reduction and `SCAModule`. `cfg.NET = 'MCC'` selects the original Swin model.
 
-- Set `cfg.PRE_BACKBONE_WEIGHT` to a matching RGB RWKV-SAM checkpoint and `cfg.GPU_ID` to one CUDA device. The default variant is Large. With `cfg.MM = True`, RGB and NIR enter the backbone together. The RGB stem weights are preserved, and the new NIR weights start at zero. With `cfg.MM = False`, the backbone uses RGB.
+On Linux, install the environment and download the official checkpoint:
+
+```bash
+SAM2_BUILD_CUDA=0 uv sync --locked
+mkdir -p pretrained_models
+wget -c -P pretrained_models https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+```
+
+- Set `cfg.GPU_ID` for the training GPUs. The model loads the Hiera trunk from `cfg.PRE_BACKBONE_WEIGHT`. With `cfg.MM = True`, it expands the RGB stem with zero-initialized NIR filters. With `cfg.MM = False`, the backbone uses RGB.
 - Dataset defaults to project-local `NWPU-MOC/`. The layout is the official `rgb/`, `ir/`, `gt/` and split lists. Set `NWPU_MOC_ROOT` to override it.
-- In a CUDA-enabled environment with the `rwkv` dependencies installed, run `python train.py`. For a smoke run, use `cfg.MAX_STEPS = 3` and `cfg.VAL_SAMPLES = 4`.
+- In a CUDA-enabled environment, run `.venv/bin/python train.py`. For a smoke run, use `cfg.MAX_STEPS = 3` and `cfg.VAL_SAMPLES = 4`.
 - To evaluate, set `model_path` and `gpu_id` at the top of `test.py`, then run `python test.py`. The loader accepts direct weights and `net` checkpoints. Results are written under the selected experiment.
 - `Mask_loss` requires a custom training data loader that supplies binary `mask_map` tensors. The NWPU-MOC loader supplies point labels.
 
