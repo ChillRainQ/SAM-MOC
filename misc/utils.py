@@ -267,31 +267,43 @@ def adjust_double_learning_rate(optimizer,
         coff = (1-cur_iters/max_iters)**power
         lr1 = (base_lr - min_lr)*coff + min_lr
         lr2 = (conv_lr - min_lr)*coff + min_lr
-        optimizer.param_groups[0]['lr'] = lr2
-        optimizer.param_groups[1]['lr'] = lr1
+        for i_p, param in enumerate(optimizer.param_groups,0):
+            if i_p<2:
+                optimizer.param_groups[i_p]['lr'] = lr2
+            elif i_p<5:
+                optimizer.param_groups[i_p]['lr'] = lr1
+            else:
+                print('Invalid lr schedule setting!')
         return lr1, lr2
     else:
-        optimizer.param_groups[0]['lr'] = warmup_conv_lr
-        optimizer.param_groups[1]['lr'] = warmup_base_lr
+        for i_p, param in enumerate(optimizer.param_groups,0):
+            if i_p<2:
+                optimizer.param_groups[i_p]['lr'] = warmup_conv_lr
+            elif i_p<5:
+                optimizer.param_groups[i_p]['lr'] = warmup_base_lr
+            else:
+                print('Invalid lr schedule setting!')
         return warmup_base_lr, warmup_conv_lr
 
 def logger(exp_path, exp_name, work_dir, exception, resume=False):
 
     from tensorboardX import SummaryWriter
     
-    run_dir = os.path.join(exp_path, exp_name)
-    os.makedirs(run_dir, exist_ok=True)
-    log_file = os.path.join(run_dir, exp_name + '.txt')
-
-    with open(os.path.join(work_dir, 'config.py'), encoding='utf-8') as cfg_file:
-        config_source = cfg_file.read()
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(config_source + '\n\n\n\n')
+    if not os.path.exists(exp_path):
+        os.mkdir(exp_path)
+    writer = SummaryWriter(exp_path+ '/' + exp_name)
+    log_file = exp_path + '/' + exp_name + '/' + exp_name + '.txt'
+    
+    cfg_file = open('./config.py',"r")  
+    cfg_lines = cfg_file.readlines()
+    
+    with open(log_file, 'a') as f:
+        f.write(''.join(cfg_lines) + '\n\n\n\n')
 
     if not resume:
         copy_cur_env(work_dir, exp_path+ '/' + exp_name + '/code', exception)
 
-    return SummaryWriter(run_dir), log_file
+    return writer, log_file
 
 
 def setlogger(path):
@@ -468,11 +480,7 @@ def copy_cur_env(work_dir, dst_dir, exception):
     if not os.path.exists(dst_dir):
         os.mkdir(dst_dir)
 
-    excluded = {'.git', '.idea', '.venv', '__pycache__', 'third_party', 'NWPU-MOC', 'pretrain_models',
-                'pretrained_models', 'exp_test', os.path.basename(os.path.normpath(os.path.dirname(os.path.dirname(dst_dir))))}
     for filename in os.listdir(work_dir):
-        if filename in excluded:
-            continue
 
         file = os.path.join(work_dir,filename)
         dst_file = os.path.join(dst_dir,filename)
@@ -481,42 +489,6 @@ def copy_cur_env(work_dir, dst_dir, exception):
             shutil.copytree(file, dst_file)
         elif os.path.isfile(file):
             shutil.copyfile(file,dst_file)
-
-
-def save_metric_report(directory, categories, mae, rmse, weighted_mse, epoch=None):
-    import json
-    from pathlib import Path
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.figure import Figure
-
-    directory = Path(directory)
-    path = directory / "metrics.json"
-    history = json.loads(path.read_text(encoding="utf-8")) if epoch is not None and path.is_file() else []
-    row = {
-        "epoch": epoch, "classes": categories,
-        "mae": np.asarray(mae).tolist(), "rmse": np.asarray(rmse).tolist(),
-        "mean_mae": float(np.mean(mae)), "mean_rmse": float(np.mean(rmse)),
-        "cls_weight_mse": float(weighted_mse),
-    }
-    history.append(row)
-    path.write_text(json.dumps(history, indent=2), encoding="utf-8")
-
-    figure = Figure(figsize=(12, 4), layout="constrained")
-    FigureCanvasAgg(figure)
-    for axis, metric in zip(figure.subplots(1, 2), ("mae", "rmse"), strict=True):
-        axis.bar(categories, row[metric])
-        axis.tick_params(axis="x", rotation=25)
-        axis.set_title(f"{metric.upper()} · macro {row['mean_' + metric]:.3f}")
-    figure.savefig(directory / "class_metrics.png", dpi=140)
-    if len(history) > 1:
-        figure.clear()
-        for axis, metric in zip(figure.subplots(1, 2), ("mae", "rmse"), strict=True):
-            for index, category in enumerate(categories):
-                axis.plot([value["epoch"] for value in history],
-                          [value[metric][index] for value in history], label=category)
-            axis.set(xlabel="Epoch", ylabel=metric.upper())
-            axis.legend()
-        figure.savefig(directory / "class_trends.png", dpi=140)
 
 
 class AverageMeter(object):

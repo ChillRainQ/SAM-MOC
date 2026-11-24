@@ -15,7 +15,7 @@ class CosSim_Loss(nn.Module):
         batch_size = pred.shape[0]
         n_map = pred.shape[1]
 
-        cos_sim = pred.new_ones((batch_size, n_map, n_map))
+        cos_sim = torch.ones((batch_size, n_map, n_map))
         for b in range(batch_size):
            for i in range(n_map):
                for j in range(i+1, n_map):

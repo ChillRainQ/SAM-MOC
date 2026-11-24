@@ -1,7 +1,7 @@
 import os
 from easydict import EasyDict as edict
 import time
-from pathlib import Path
+import torch
 
 # init
 __C = edict()
@@ -14,43 +14,12 @@ __C.DATASET = 'MOC_RS' # dataset selection: RGBT, DRONERGBT, GCC, SHHA, SHHB, UC
 
 
 #是否使用NIR
-__C.MM = False
+__C.MM= False 
 
-__C.NET = 'SAM2MCC'  # Use 'MCC' for the original Swin baseline
-__C.SAM2_VARIANT = 'base_plus'  # 'base_plus' or 'large'
+__C.NET = 'MCC'
 
 
-__C.PRE_BACKBONE_WEIGHT = Path(__file__).resolve().parent / "pretrained_models" / f"sam2.1_hiera_{__C.SAM2_VARIANT}.pt"
-__C.DATA_PATH = os.environ.get("NWPU_MOC_ROOT", str(Path(__file__).resolve().parent / "NWPU-MOC"))
-__C.MAX_STEPS = None
-__C.VAL_SAMPLES = None
-
-_SAM2_BACKBONES = {
-    "base_plus": dict(
-        hiera=dict(embed_dim=112, num_heads=2),
-        channels=(112, 224, 448, 896),
-    ),
-    "large": dict(
-        hiera=dict(
-            embed_dim=144,
-            num_heads=2,
-            stages=(2, 6, 36, 4),
-            global_att_blocks=(23, 33, 43),
-            window_pos_embed_bkg_spatial_size=(7, 7),
-            window_spec=(8, 4, 16, 8),
-        ),
-        channels=(144, 288, 576, 1152),
-    ),
-}
-
-__C.SAM2_ARCH = edict(
-    variant=__C.SAM2_VARIANT,
-    backbone=_SAM2_BACKBONES[__C.SAM2_VARIANT],
-    fpn=dict(width=128),
-    decode_head=dict(width=64),
-    nir=dict(channels=1),
-    mask=dict(classes=2),
-)
+__C.PRE_BACKBONE_WEIGHT = ''
 
 
 __C.POS_EMBEDDING = False
@@ -63,14 +32,14 @@ __C.RESUME_PATH = '' #
 
 __C.BACKBONE_FREEZE = False
 
-__C.GPU_ID = [2] # sigle gpu: [0], [1] ...; multi gpus: [0,1]
+__C.GPU_ID = [0] # sigle gpu: [0], [1] ...; multi gpus: [0,1]
 
 __C.TRAIN_SIZE = (512,512) 
 
 __C.TRAIN_BATCH_SIZE = 4
 
-__C.BASE_LR = 5e-5  # FPN and counting layers
-__C.CONV_LR = 1e-6  # Image backbone
+__C.BASE_LR = 5*1e-5
+__C.CONV_LR = 1e-6
 __C.WEIGHT_DECAY = 1e-4
 
 __C.LOSS_FUNCTION = 'Mse_loss' # 'Bay_loss' or 'Mse_loss' or 'Bmc_loss' or 'Mix_loss' or 'Trans_loss' or 'Cos_loss' 
@@ -124,4 +93,4 @@ __C.VAL_FREQ = [10,4,4,4]
 
 __C.CP_FREQ = 10
 
-#================================================================================
+#================================================================================  

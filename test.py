@@ -1,7 +1,5 @@
 from locale import getlocale
-import json
 import os
-from pathlib import Path
 import torch
 from torch.autograd import Variable
 import torchvision.transforms as standard_transforms
@@ -17,11 +15,17 @@ from PIL import Image
 
 import time
 
-from checkpoint import load_counter_weights
+from torch.utils.tensorboard import SummaryWriter
 
 import datasets
 
 from config import cfg
+
+seed = 42
+if seed is not None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
 #------------prepare data loader------------
 dataset = 'MOC_RS'
@@ -31,8 +35,12 @@ model_path = ''
 datasetting = import_module(f'datasets.setting.{dataset}')
 cfg_data = datasetting.cfg_data
 
-net_name = cfg.NET
+net_name = 'MCC'
 gpu_id = [0]
+
+if len(gpu_id)==1:
+    torch.cuda.set_device(gpu_id[0])
+torch.backends.cudnn.benchmark = True
 
 visible = True
 vis_freq = 1 
@@ -50,31 +58,20 @@ test_size = cfg.TRAIN_SIZE
 mean_std_rgb = cfg_data.MEAN_STD_RGB
 mean_std_ir = cfg_data.MEAN_STD_IR
 
+now = time.strftime("%m-%d_%H-%M", time.localtime())
+test_name = now \
+            + '_' + model_path.replace("/","_").replace(".pth","")
+    
+save_path = os.path.join('exp_test',test_name)
+if not os.path.exists(save_path):
+    os.makedirs(save_path)
+    
+writer = SummaryWriter(save_path)   
+
 def main():
-    global save_path
-    if not model_path:
-        raise ValueError("Set model_path in test.py to an existing experiment checkpoint")
-    checkpoint = Path(model_path).resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
-    experiment = next((parent for parent in checkpoint.parents if (parent / "model_config.json").is_file()),
-                      checkpoint.parent)
-    saved = experiment / "model_config.json"
-    if saved.is_file():
-        cfg.update(json.loads(saved.read_text(encoding="utf-8")))
-    else:
-        cfg.NET = net_name
-    torch.cuda.set_device(gpu_id[0])
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    if cfg.SEED is not None:
-        np.random.seed(cfg.SEED)
-        torch.manual_seed(cfg.SEED)
-    save_path = experiment / f"test_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
-    save_path.mkdir()
     test_loader = datasets.loading_test_data(dataset)
-    net = CrowdCounter(cfg.NET, gpu_id, pretrained=False)
-    load_counter_weights(checkpoint, net)
+    net = CrowdCounter(net_name, gpu_id)
+    net.load_state_dict(torch.load(model_path, map_location=lambda storage, loc: storage.cuda(gpu_id[0])), strict=True)                     
                        
     print("__loading__test__model__")
     net.eval()
@@ -171,7 +168,7 @@ def test(net, test_loader):
                 h, w, rh, rw = h//label_factor, w//label_factor, rh//label_factor, rh//label_factor
 
                 idx = 0
-                pred_map = torch.zeros(b, num_class, h, w).cuda()
+                pred_map = torch.zeros(b, 1, h, w).cuda()
                 for i in range(0, h, rh):
                     gis, gie = max(min(h-rh, i), 0), min(h, i+rh)
                     for j in range(0, w, rw):
@@ -208,7 +205,6 @@ def test(net, test_loader):
     
     cls_avg_mae = sum(overall_mae) / len(categorys)
     cls_avg_rmse = sum(overall_rmse) / len(categorys)
-    save_metric_report(save_path, categorys, overall_mae, overall_rmse, cls_weight_mse)
 
 
     log_str = 'Test{}, cls_avg_mae {cls_avg_mae:.4f} cls_avg_mse {cls_avg_rmse:.4f} cls_weight_mse {cls_weight_mse:.4f}'.\

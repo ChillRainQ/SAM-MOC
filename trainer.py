@@ -1,5 +1,4 @@
 import numpy as np
-import json
 
 import torch
 from torch import optim
@@ -10,8 +9,9 @@ from config import cfg
 from misc.utils import *
 import datasets
 
+from tqdm import tqdm
 from torchvision.utils import make_grid
-from misc.utils import adjust_double_learning_rate
+from misc.utils import adjust_learning_rate, adjust_double_learning_rate
 
 class Trainer():
     def __init__(self, cfg_data, pwd):
@@ -28,38 +28,26 @@ class Trainer():
         self.gpu_id = cfg.GPU_ID
 
         self.writer, self.log_txt = logger(self.exp_path, self.exp_name, self.pwd, 'exp', resume=cfg.RESUME) 
-        with open(os.path.join(self.exp_path, self.exp_name, "model_config.json"), "w", encoding="utf-8") as f:
-            json.dump({key: cfg[key] for key in ("NET", "MM", "LOSS_FUNCTION", "TRAIN_SIZE", "SAM2_ARCH", "BASE_LR", "CONV_LR")},
-                      f, indent=2)
 
-        self.net = CrowdCounter(self.net_name, self.gpu_id, pretrained=not (cfg.RESUME or cfg.PRE_GCC))
+        self.net = CrowdCounter(self.net_name, self.gpu_id)
         
         self.categorys = self.cfg_data.CATEGORYS
         self.num_classes = len(self.categorys)
 
-        model = self.net.CCN
-        if isinstance(model, torch.nn.DataParallel):
-            model = model.module
-        self.backbone = model.Extractor if self.net_name == "MCC" else model.backbone
-        if cfg.BACKBONE_FREEZE:
-            self.backbone.requires_grad_(False)
-        backbone_params = list(self.backbone.parameters())
-        backbone_ids = {id(param) for param in backbone_params}
-        other_params = [param for param in self.net.parameters() if id(param) not in backbone_ids]
-        self.optimizer = optim.AdamW([
-            {'params': backbone_params, 'lr': cfg.CONV_LR},
-            {'params': other_params, 'lr': cfg.BASE_LR},
-        ], weight_decay=cfg.WEIGHT_DECAY)
+        if cfg.BACKBONE_FREEZE:       
+            self.optimizer = optim.AdamW([
+                {'params': [param for name, param in self.net.named_parameters() if 'backbone' in name], 'lr': cfg.CONV_LR, 'weight_decay': cfg.WEIGHT_DECAY},
+                {'params': [param for name, param in self.net.named_parameters() if 'backbone' not in name], 'lr': cfg.BASE_LR, 'weight_decay': cfg.WEIGHT_DECAY},
+            ])
+        else:
+            self.optimizer = optim.AdamW(self.net.parameters(), lr=cfg.BASE_LR, weight_decay=cfg.WEIGHT_DECAY)
 
         self.train_record = {'best_cls_avg_mae': 1e20, 'best_cls_avg_mse':1e20, 'best_cls_weight_mse':1e20, 'best_model_name': ''}
         self.timer = {'iter time' : Timer(),'train time' : Timer(),'val time' : Timer()} 
 
         self.epoch = 0
         self.i_tb = 0
-        steps = len(self.train_loader)
-        if cfg.MAX_STEPS is not None:
-            steps = min(steps, cfg.MAX_STEPS)
-        self.num_iters = cfg.MAX_EPOCH * steps
+        self.num_iters = cfg.MAX_EPOCH * np.int(len(self.train_loader))
         self.train_loss_avg = 0
         self.val_loss_avg = 0
         
@@ -67,36 +55,15 @@ class Trainer():
             self.net.load_state_dict(torch.load(cfg.PRE_GCC_MODEL))
 
         if cfg.RESUME:
-            from checkpoint import read_checkpoint
-            latest_state = read_checkpoint(cfg.RESUME_PATH)
+            latest_state = torch.load(cfg.RESUME_PATH)
             self.net.load_state_dict(latest_state['net'])
-            self.load_optimizer_state(latest_state['optimizer'])
+            self.optimizer.load_state_dict(latest_state['optimizer'])
             self.epoch = latest_state['epoch'] + 1
             self.i_tb = latest_state['i_tb']
             self.num_iters = latest_state['num_iters']
             self.train_record = latest_state['train_record']
             self.exp_path = latest_state['exp_path']
             self.exp_name = latest_state['exp_name']
-            self.update_learning_rates()
-
-    def load_optimizer_state(self, state):
-        saved_groups = [group for group in state["param_groups"] if group["params"]]
-        if len(saved_groups) == 1:
-            # Older single-LR runs stored parameters in model registration order.
-            saved_group = saved_groups[0]
-            saved_ids = dict(zip(self.net.parameters(), saved_group["params"], strict=True))
-            groups = [
-                {**saved_group, "params": [saved_ids[param] for param in group["params"]]}
-                for group in self.optimizer.param_groups
-            ]
-            state = {**state, "param_groups": groups}
-        self.optimizer.load_state_dict(state)
-
-    def update_learning_rates(self):
-        return adjust_double_learning_rate(
-            self.optimizer, self.i_tb, self.num_iters, warmup_iters=500,
-            base_lr=cfg.BASE_LR, conv_lr=cfg.CONV_LR,
-        )
 
 
     def forward(self):
@@ -114,7 +81,7 @@ class Trainer():
 
             print( 'train time: {:.2f}s'.format(self.timer['train time'].diff) )
             print( 'train time: {:.2f}s'.format(self.timer['train time'].diff), file=record )
-            if self.epoch % cfg.CP_FREQ == 0 or self.epoch + 1 == cfg.MAX_EPOCH:
+            if self.epoch % cfg.CP_FREQ == 0:
                 save_checkpoint(self)
             print( '='*20 )
             print( '='*20, file=record )
@@ -137,8 +104,6 @@ class Trainer():
     def train(self): # training for all datasets
         
         self.net.train()
-        if cfg.BACKBONE_FREEZE:
-            self.backbone.eval()
         
         train_losses = AverageMeter()
         
@@ -175,27 +140,34 @@ class Trainer():
             
             train_losses.update(loss.item())
             
-            base_lr, conv_lr = self.update_learning_rates()
+            if cfg.BACKBONE_FREEZE:
+                base_lr, conv_lr = adjust_double_learning_rate(self.optimizer, self.i_tb, self.num_iters, base_lr=cfg.BASE_LR, conv_lr = cfg.CONV_LR)
+            else:
+                base_lr = adjust_learning_rate(self.optimizer, self.i_tb, self.num_iters, lr=cfg.BASE_LR)
                 
             record_path = os.path.join(self.exp_path, self.exp_name, 'log.txt')
             record = open(record_path, 'a+')
 
             if (it + 1) % cfg.PRINT_FREQ == 0:
                 self.writer.add_scalar('train_base_lr', base_lr, self.i_tb)
-                self.writer.add_scalar('train_backbone_lr', conv_lr, self.i_tb)
                 self.writer.add_scalar('train_loss', loss.item(), self.i_tb)
                 self.timer['iter time'].toc(average=False)
 
-                log = ('[ep %d][it %d][loss %.4f][conv_lr %.8f][base_lr %.8f][%.2fs]' %
-                       (self.epoch + 1, it + 1, loss.item(), conv_lr, base_lr, self.timer['iter time'].diff))
-                print(log)
-                print(log, file=record)
+                if cfg.BACKBONE_FREEZE:
+                    print( '[ep %d][it %d][loss %.4f][conv_lr %.8f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.optimizer.param_groups[1]['lr'], self.timer['iter time'].diff) )
+                    print( '[ep %d][it %d][loss %.4f][conv_lr %.8f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.optimizer.param_groups[1]['lr'], self.timer['iter time'].diff), file=record )
+                
+                else:      
+                    print( '[ep %d][it %d][loss %.4f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.timer['iter time'].diff) )
+                    print( '[ep %d][it %d][loss %.4f][base_lr %.8f][%.2fs]' % \
+                            (self.epoch + 1, it + 1, loss.item(), self.optimizer.param_groups[0]['lr'], self.timer['iter time'].diff), file=record )
                 for c_idx in range(self.num_classes):
                     print( '       ', self.categorys[c_idx],':  [cnt: gt: %.1f pred: %.2f]' % (gt_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA, pred_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA) ) 
                     print( '       ', self.categorys[c_idx],':  [cnt: gt: %.1f pred: %.2f]' % (gt_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA, pred_map[0][c_idx].sum().data/self.cfg_data.LOG_PARA), file=record ) 
             record.close()
-            if cfg.MAX_STEPS is not None and it + 1 >= cfg.MAX_STEPS:
-                break
 
         self.train_loss_avg = train_losses.avg
 
@@ -238,13 +210,13 @@ class Trainer():
                     crop_RGBs, crop_Ts, crop_masks = map(lambda x: torch.cat(x, dim=0), (crop_RGBs, crop_Ts, crop_masks))
 
                     crop_data = {'rgb': crop_RGBs, 'nir': crop_Ts,}
-                    crop_outputs = self.net(crop_data, num_class, mode='val')
+                    crop_outputs = self.net(crop_data, mode = 'val')
                     crop_preds = crop_outputs['pred_map']
 
                     h, w, rh, rw = h//self.cfg_data.LABEL_FACTOR, w//self.cfg_data.LABEL_FACTOR, rh//self.cfg_data.LABEL_FACTOR, rh//self.cfg_data.LABEL_FACTOR
 
                     idx = 0
-                    pred_map = torch.zeros(b, num_class, h, w).cuda()
+                    pred_map = torch.zeros(b, 1, h, w).cuda()
                     for i in range(0, h, rh):
                         gis, gie = max(min(h-rh, i), 0), min(h, i+rh)
                         for j in range(0, w, rw):
@@ -259,8 +231,7 @@ class Trainer():
                     outputs = self.net(data, num_class, mode = 'val')
                     pred_map = outputs['pred_map']
 
-                target = self.net.multi_class_gauss_map_generate(gt_map)
-                val_losses.update(torch.nn.functional.mse_loss(pred_map, target).item())
+                val_losses.update(self.net.loss.item())
                 
                 # abs_errors, square_errors = eval(pred_map, gt_map, self.cfg_data.LOG_PARA)
                 abs_errors, square_errors, weights = eval_mc(pred_map, gt_map, self.cfg_data.LOG_PARA)
@@ -272,10 +243,8 @@ class Trainer():
 
 
                 cmses.update(wmse)
-            if cfg.VAL_SAMPLES is not None and index + 1 >= cfg.VAL_SAMPLES:
-                break
                 
-        N = val_losses.count
+        N = len(self.val_loader)                 
         self.val_loss_avg = val_losses.avg
         overall_mae = maes.avg # list
         # RMSE ??
@@ -284,8 +253,6 @@ class Trainer():
         
         cls_avg_mae = sum(overall_mae) / self.num_classes
         cls_avg_rmse = sum(overall_rmse) / self.num_classes
-        save_metric_report(os.path.join(self.exp_path, self.exp_name), self.categorys, overall_mae,
-                           overall_rmse, cls_weight_mse, epoch=self.epoch + 1)
 
         self.writer.add_scalar('val_loss', self.val_loss_avg, self.epoch + 1)
         self.writer.add_scalar('cls_weight_mse', cls_weight_mse, self.epoch + 1)

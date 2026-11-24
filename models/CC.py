@@ -11,7 +11,7 @@ from config import cfg
 
 
 class CrowdCounter(nn.Module):
-    def __init__(self, net_name, gpu_id, *, pretrained=True, device="cuda"):
+    def __init__(self, net_name, gpu_id):
         super(CrowdCounter, self).__init__()
         
 
@@ -22,36 +22,36 @@ class CrowdCounter(nn.Module):
         
         self.MM = cfg.MM
         self.alpha = cfg.alpha
-        self.CCN = ccnet(pretrained=pretrained)
+        self.CCN = ccnet()
         
         self.gs = gs_layer()
         
         if len(gpu_id) > 1:
-            ids = gpu_id
-            self.CCN = torch.nn.DataParallel(self.CCN, device_ids=ids).to(device)
-            self.gs = torch.nn.DataParallel(self.gs, device_ids=ids).to(device)
+            ids = range(len(gpu_id))  
+            self.CCN = torch.nn.DataParallel(self.CCN, device_ids=ids).cuda()
+            self.gs = torch.nn.DataParallel(self.gs, device_ids=ids).cuda()
         else:
-            self.CCN = self.CCN.to(device)
-            self.gs = self.gs.to(device)
+            self.CCN = self.CCN.cuda()
+            self.gs = self.gs.cuda()
         
         if cfg.LOSS_FUNCTION == 'Cos_loss':
-            self.loss_mse_fn = nn.MSELoss(reduction='mean')
-            self.loss_cossim_fn = CosSim_Loss()
+            self.loss_mse_fn = nn.MSELoss(reduction='mean').cuda()
+            self.loss_cossim_fn = CosSim_Loss().cuda()
 
         
         elif cfg.LOSS_FUNCTION == 'Mse_loss':
-                self.loss_mse_fn = nn.MSELoss(reduction='mean')
+                self.loss_mse_fn = nn.MSELoss(reduction='mean').cuda()
         
         elif cfg.LOSS_FUNCTION == 'Mix_loss':
-            self.loss_l1_fn = nn.L1Loss(reduction='mean')
-            self.loss_mse_fn = nn.MSELoss(reduction='mean')
+            self.loss_l1_fn = nn.L1Loss(reduction='mean').cuda()
+            self.loss_mse_fn = nn.MSELoss(reduction='mean').cuda()
         
         elif cfg.LOSS_FUNCTION == 'Mask_loss':
-            self.loss_l1_fn = nn.L1Loss(reduction='mean')
-            self.loss_mse_fn = nn.MSELoss(reduction='mean')
-            self.loss_seg_fn = nn.CrossEntropyLoss()
+            self.loss_l1_fn = nn.L1Loss(reduction='mean').cuda()
+            self.loss_mse_fn = nn.MSELoss(reduction='mean').cuda()            
+            self.loss_seg_fn = nn.CrossEntropyLoss().cuda()
         else:
-            raise ValueError(f"Unknown loss function: {cfg.LOSS_FUNCTION}")
+            return 'error'
 
         
     @property
@@ -62,15 +62,7 @@ class CrowdCounter(nn.Module):
         rgb, nir = data['rgb'], data['nir']
         nir = nir[:,0,:,:].unsqueeze(1) 
      
-        pred_mask_maps = None
-        if self.net_name == 'SAM2MCC':
-            nir = nir if self.MM else None
-            if mode == 'train' and cfg.LOSS_FUNCTION == 'Mask_loss':
-                pred_map, masks = self.CCN(rgb, nir, return_mask=True)
-                pred_mask_maps = masks.unbind(1)
-            else:
-                pred_map = self.CCN(rgb, nir)
-        elif self.net_name == 'MCC':
+        if self.net_name == 'MCC':
             pred_map = self.CCN(rgb,nir)
         else:        
             pred_map = self.CCN(rgb)
@@ -105,12 +97,8 @@ class CrowdCounter(nn.Module):
                 return outputs
             
             elif cfg.LOSS_FUNCTION == 'Mask_loss':
-                if pred_mask_maps is None:
-                    raise ValueError("Mask_loss requires the SAM2MCC mask head")
-                if 'mask_map' not in data:
-                    raise ValueError("Mask_loss requires a training batch with binary mask_map targets")
                 mask_map = data['mask_map']
-                outputs['pred_mask_maps'] = pred_mask_maps
+                pred_mask_maps = outputs['pred_mask_maps']
                 gauss_map = self.multi_class_gauss_map_generate(gt_map)
                 self.loss_fn = self.build_mask_loss(pred_map, gauss_map, mask_map, pred_mask_maps, iter) 
                 outputs['gauss_map'] = gauss_map
@@ -123,7 +111,7 @@ class CrowdCounter(nn.Module):
 
     def build_cos_loss(self, pred_map, gauss_map, iter, alpha, beta, lambda_, reg_params):
         mse_loss = self.loss_mse_fn(pred_map, gauss_map)  
-        c_loss = self.loss_cossim_fn(pred_map)
+        c_loss = self.loss_cossim_fn(pred_map).cuda()
 
 
         loss = alpha * c_loss + beta * mse_loss
